@@ -1,0 +1,383 @@
+// Package sstable implements immutable, sorted on-disk tables.
+//
+// File layout:
+//
+//	[data block]...[data block][index block][bloom filter][footer]
+//
+// A data block is a run of encoded entries (~4 KiB) followed by a crc32c.
+// The index block lists each data block's first key, offset and length,
+// followed by a crc32c. The 48-byte footer locates the index and filter:
+//
+//	indexOff(8) | indexLen(8) | bloomOff(8) | bloomLen(8) | count(8) | magic(8)
+package sstable
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"hash/crc32"
+	"os"
+	"sort"
+
+	"github.com/1001harshit/emberkv/internal/base"
+	"github.com/1001harshit/emberkv/internal/bloom"
+)
+
+const (
+	targetBlockSize        = 4096
+	footerSize             = 48
+	magic           uint64 = 0x31564b5245424d45 // "EMBERKV1" little-endian
+)
+
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
+
+type indexEntry struct {
+	firstKey []byte
+	offset   uint64
+	length   uint64
+}
+
+// Writer builds an SSTable from entries added in strictly increasing key order.
+type Writer struct {
+	f          *os.File
+	bw         *bufio.Writer
+	path       string
+	bitsPerKey int
+
+	offset     uint64
+	block      []byte
+	blockFirst []byte
+	index      []indexEntry
+	hashes     []uint64
+	lastKey    []byte
+	count      uint64
+	err        error
+}
+
+// Create starts a new table at path.
+func Create(path string, bitsPerKey int) (*Writer, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &Writer{f: f, bw: bufio.NewWriterSize(f, 64<<10), path: path, bitsPerKey: bitsPerKey}, nil
+}
+
+// Count returns the number of entries added so far.
+func (w *Writer) Count() uint64 { return w.count }
+
+// Add appends an entry. Keys must be strictly increasing.
+func (w *Writer) Add(e *base.Entry) error {
+	if w.err != nil {
+		return w.err
+	}
+	if w.count > 0 && bytes.Compare(e.Key, w.lastKey) <= 0 {
+		w.err = fmt.Errorf("sstable: key %q added out of order", e.Key)
+		return w.err
+	}
+	if len(w.block) == 0 {
+		w.blockFirst = bytes.Clone(e.Key)
+	}
+	w.block = base.AppendEntry(w.block, e)
+	w.lastKey = append(w.lastKey[:0], e.Key...)
+	w.hashes = append(w.hashes, bloom.Hash(e.Key))
+	w.count++
+	if len(w.block) >= targetBlockSize {
+		return w.flushBlock()
+	}
+	return nil
+}
+
+func (w *Writer) write(p []byte) {
+	if w.err != nil {
+		return
+	}
+	_, w.err = w.bw.Write(p)
+	w.offset += uint64(len(p))
+}
+
+func (w *Writer) flushBlock() error {
+	if len(w.block) == 0 {
+		return w.err
+	}
+	w.block = binary.LittleEndian.AppendUint32(w.block, crc32.Checksum(w.block, crcTable))
+	w.index = append(w.index, indexEntry{firstKey: w.blockFirst, offset: w.offset, length: uint64(len(w.block))})
+	w.write(w.block)
+	w.block = w.block[:0]
+	return w.err
+}
+
+// Finish writes the index, filter and footer, then fsyncs and closes the file.
+func (w *Writer) Finish() error {
+	w.flushBlock()
+
+	indexOff := w.offset
+	var idx []byte
+	idx = binary.AppendUvarint(idx, uint64(len(w.index)))
+	for _, ie := range w.index {
+		idx = binary.AppendUvarint(idx, uint64(len(ie.firstKey)))
+		idx = append(idx, ie.firstKey...)
+		idx = binary.AppendUvarint(idx, ie.offset)
+		idx = binary.AppendUvarint(idx, ie.length)
+	}
+	idx = binary.LittleEndian.AppendUint32(idx, crc32.Checksum(idx, crcTable))
+	w.write(idx)
+
+	bloomOff := w.offset
+	filter := bloom.Build(w.hashes, w.bitsPerKey).Marshal()
+	w.write(filter)
+
+	var footer [footerSize]byte
+	binary.LittleEndian.PutUint64(footer[0:], indexOff)
+	binary.LittleEndian.PutUint64(footer[8:], uint64(len(idx)))
+	binary.LittleEndian.PutUint64(footer[16:], bloomOff)
+	binary.LittleEndian.PutUint64(footer[24:], uint64(len(filter)))
+	binary.LittleEndian.PutUint64(footer[32:], w.count)
+	binary.LittleEndian.PutUint64(footer[40:], magic)
+	w.write(footer[:])
+
+	if w.err == nil {
+		w.err = w.bw.Flush()
+	}
+	if w.err == nil {
+		w.err = w.f.Sync()
+	}
+	if cerr := w.f.Close(); w.err == nil {
+		w.err = cerr
+	}
+	if w.err != nil {
+		os.Remove(w.path)
+	}
+	return w.err
+}
+
+// Abort discards a table that is being written.
+func (w *Writer) Abort() {
+	w.f.Close()
+	os.Remove(w.path)
+}
+
+// Reader serves lookups and scans from a finished table. It is safe for
+// concurrent use.
+type Reader struct {
+	f      *os.File
+	index  []indexEntry
+	filter *bloom.Filter
+	count  uint64
+	size   int64
+}
+
+// Open opens the table at path, loading its index and filter into memory.
+func Open(path string) (*Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	r, err := open(f)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("sstable %s: %w", path, err)
+	}
+	return r, nil
+}
+
+func open(f *os.File) (*Reader, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := fi.Size()
+	if size < footerSize {
+		return nil, base.ErrCorrupt
+	}
+	var footer [footerSize]byte
+	if _, err := f.ReadAt(footer[:], size-footerSize); err != nil {
+		return nil, err
+	}
+	if binary.LittleEndian.Uint64(footer[40:]) != magic {
+		return nil, base.ErrCorrupt
+	}
+	indexOff := binary.LittleEndian.Uint64(footer[0:])
+	indexLen := binary.LittleEndian.Uint64(footer[8:])
+	bloomOff := binary.LittleEndian.Uint64(footer[16:])
+	bloomLen := binary.LittleEndian.Uint64(footer[24:])
+	limit := uint64(size - footerSize)
+	if indexLen < 4 || indexOff+indexLen > limit || bloomOff+bloomLen > limit {
+		return nil, base.ErrCorrupt
+	}
+
+	idx := make([]byte, indexLen)
+	if _, err := f.ReadAt(idx, int64(indexOff)); err != nil {
+		return nil, err
+	}
+	body := idx[:len(idx)-4]
+	if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(idx[len(idx)-4:]) {
+		return nil, base.ErrCorrupt
+	}
+	index, err := decodeIndex(body)
+	if err != nil {
+		return nil, err
+	}
+
+	fb := make([]byte, bloomLen)
+	if _, err := f.ReadAt(fb, int64(bloomOff)); err != nil {
+		return nil, err
+	}
+	filter, err := bloom.Unmarshal(fb)
+	if err != nil {
+		return nil, err
+	}
+	return &Reader{
+		f:      f,
+		index:  index,
+		filter: filter,
+		count:  binary.LittleEndian.Uint64(footer[32:]),
+		size:   size,
+	}, nil
+}
+
+func decodeIndex(b []byte) ([]indexEntry, error) {
+	n, m := binary.Uvarint(b)
+	if m <= 0 || n > uint64(len(b)) {
+		return nil, base.ErrCorrupt
+	}
+	off := m
+	next := func() (uint64, bool) {
+		v, m := binary.Uvarint(b[off:])
+		if m <= 0 {
+			return 0, false
+		}
+		off += m
+		return v, true
+	}
+	index := make([]indexEntry, 0, n)
+	for i := uint64(0); i < n; i++ {
+		kl, ok := next()
+		if !ok || kl > uint64(len(b)-off) {
+			return nil, base.ErrCorrupt
+		}
+		key := b[off : off+int(kl)]
+		off += int(kl)
+		bo, ok1 := next()
+		bl, ok2 := next()
+		if !ok1 || !ok2 || bl < 4 {
+			return nil, base.ErrCorrupt
+		}
+		index = append(index, indexEntry{firstKey: key, offset: bo, length: bl})
+	}
+	return index, nil
+}
+
+// Count returns the number of entries in the table.
+func (r *Reader) Count() uint64 { return r.count }
+
+// Size returns the file size in bytes.
+func (r *Reader) Size() int64 { return r.size }
+
+// Close closes the underlying file.
+func (r *Reader) Close() error { return r.f.Close() }
+
+// findBlock returns the index of the last block whose first key is <= key,
+// or -1 if key sorts before every block.
+func (r *Reader) findBlock(key []byte) int {
+	i := sort.Search(len(r.index), func(i int) bool {
+		return bytes.Compare(r.index[i].firstKey, key) > 0
+	})
+	return i - 1
+}
+
+// readBlock reads and verifies a data block. Each call returns a fresh buffer,
+// so decoded entries stay valid after later reads.
+func (r *Reader) readBlock(i int) ([]byte, error) {
+	ie := r.index[i]
+	buf := make([]byte, ie.length)
+	if _, err := r.f.ReadAt(buf, int64(ie.offset)); err != nil {
+		return nil, err
+	}
+	body := buf[:len(buf)-4]
+	if crc32.Checksum(body, crcTable) != binary.LittleEndian.Uint32(buf[len(buf)-4:]) {
+		return nil, base.ErrCorrupt
+	}
+	return body, nil
+}
+
+// Get returns the entry for key, including tombstones.
+func (r *Reader) Get(key []byte) (base.Entry, bool, error) {
+	if !r.filter.MayContain(key) {
+		return base.Entry{}, false, nil
+	}
+	bi := r.findBlock(key)
+	if bi < 0 {
+		return base.Entry{}, false, nil
+	}
+	block, err := r.readBlock(bi)
+	if err != nil {
+		return base.Entry{}, false, err
+	}
+	for off := 0; off < len(block); {
+		e, n, err := base.DecodeEntry(block[off:])
+		if err != nil {
+			return base.Entry{}, false, err
+		}
+		switch c := bytes.Compare(e.Key, key); {
+		case c == 0:
+			return e, true, nil
+		case c > 0:
+			return base.Entry{}, false, nil
+		}
+		off += n
+	}
+	return base.Entry{}, false, nil
+}
+
+// Iterator returns an iterator over entries with key >= start (nil means all).
+func (r *Reader) Iterator(start []byte) base.Iterator {
+	bi := 0
+	if start != nil {
+		bi = max(r.findBlock(start), 0)
+	}
+	return &iterator{r: r, bi: bi - 1, start: start}
+}
+
+type iterator struct {
+	r     *Reader
+	bi    int
+	block []byte
+	off   int
+	start []byte
+	cur   base.Entry
+	err   error
+}
+
+func (it *iterator) Next() bool {
+	for it.err == nil {
+		if it.off >= len(it.block) {
+			it.bi++
+			if it.bi >= len(it.r.index) {
+				return false
+			}
+			it.block, it.err = it.r.readBlock(it.bi)
+			it.off = 0
+			continue
+		}
+		e, n, err := base.DecodeEntry(it.block[it.off:])
+		if err != nil {
+			it.err = err
+			return false
+		}
+		it.off += n
+		if it.start != nil {
+			if bytes.Compare(e.Key, it.start) < 0 {
+				continue
+			}
+			it.start = nil
+		}
+		it.cur = e
+		return true
+	}
+	return false
+}
+
+func (it *iterator) Entry() *base.Entry { return &it.cur }
+func (it *iterator) Err() error         { return it.err }
