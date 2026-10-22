@@ -3,15 +3,23 @@
 [![CI](https://github.com/1001harshit/emberkv/actions/workflows/ci.yml/badge.svg)](https://github.com/1001harshit/emberkv/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/1001harshit/emberkv.svg)](https://pkg.go.dev/github.com/1001harshit/emberkv/lsm)
 
-**A persistent, Redis-compatible key-value database built from scratch in Go on a log-structured merge tree.**
+**A Redis-compatible database with time travel. Read any key as it was 10 minutes ago, undo an accidental `FLUSHALL`, and branch your whole dataset in milliseconds.**
 
-Point `redis-cli` or any Redis client library at it. Unlike Redis, your data lives on disk and survives `kill -9`. Every write goes to a checksummed write-ahead log before it is acknowledged, then moves through an in-memory skip list into immutable, Bloom-filtered SSTables that are compacted in the background.
+emberkv speaks the Redis protocol, so `redis-cli` and every Redis client library work with it. Unlike Redis, it keeps your data on disk, survives `kill -9`, and **remembers history**:
 
-No dependencies outside the Go standard library.
+```
+127.0.0.1:6380> ASOF -10m HGETALL user:42        # any read command, as of 10 minutes ago
+127.0.0.1:6380> HISTORY price                    # every past value of a key, with timestamps
+127.0.0.1:6380> ROLLBACK -5m                     # undo everything since then, FLUSHALL included
+127.0.0.1:6380> BRANCH CREATE experiment         # an instant, independent copy of the database
+127.0.0.1:6380> BRANCH USE experiment            # ...and play with it; main is untouched
+```
+
+None of Redis, Valkey, Kvrocks, Pika or Tendis can do this. emberkv can because it is built from scratch on a log-structured merge tree that keeps versions instead of overwriting them, and whose files never change once written. It has no dependencies outside the Go standard library.
 
 ```
 $ emberkv -dir ./data
-emberkv listening on 127.0.0.1:6380 (data dir "./data", fsync everysec)
+emberkv listening on 127.0.0.1:6380 (data dir "./data", fsync everysec, history 1h0m0s)
 
 $ redis-cli -p 6380
 127.0.0.1:6380> SET user:1 "ada" EX 3600
@@ -27,8 +35,47 @@ OK
 2) 1) "user:1"
 ```
 
+## Time travel and branches
+
+Every write is stored as a new **version** with a timestamp, and versions are kept for the `-history` window (one hour by default). That's what makes these possible:
+
+| Command | What it does |
+|---|---|
+| `ASOF <time> <read command> [args…]` | Runs any read command (`GET`, `MGET`, `HGETALL`, `SMEMBERS`, `KEYS`, `SCAN`, `TTL`, `DBSIZE`…) against the data as it was at `<time>`. Writes are refused. |
+| `HISTORY <key> [COUNT n]` | The key's past versions, newest first, as `[unix_ms, type, value]` (for hashes and sets the value is the size; `nil` means deleted). |
+| `ROLLBACK <time>` | Makes the whole database what it was at `<time>`, TTLs included, and replies with how many keys changed. The rollback is itself recorded in history, so it can be undone. |
+| `BRANCH CREATE <name> [ASOF <time>]` | A separate copy of the current branch, as it is now or as it was then. Built from hard links to the same immutable files, so it takes milliseconds and almost no disk: branching a 189k-key, 37 MB database took 94 ms and 4 KB. |
+| `BRANCH USE <name>` / `CURRENT` / `LIST` / `DROP <name>` | Switch this connection between branches (like `SELECT`, with names), and manage them. `main` is the database the server started with. |
+
+`<time>` is a relative duration (`-10m`, `-1h30m`), unix milliseconds, or an RFC 3339 timestamp (`2026-10-23T01:00:00Z`).
+
+```
+127.0.0.1:6380> SET price 100
+127.0.0.1:6380> SET price 250
+127.0.0.1:6380> DEL price
+127.0.0.1:6380> GET price
+(nil)
+127.0.0.1:6380> ASOF -3s GET price
+"100"
+127.0.0.1:6380> HISTORY price
+1) 1) (integer) 1792702209414
+   2) "none"
+   3) (nil)
+2) 1) (integer) 1792702207390
+   2) "string"
+   3) "250"
+3) 1) (integer) 1792702205366
+   2) "string"
+   3) "100"
+```
+
+**What it's for:** recovering from mistakes (a bad deploy, a wrong `DEL`, a `FLUSHALL` in the wrong terminal); debugging ("what did this session hold when the error happened?"); auditing changes; and trying risky migrations or load tests on a branch of real data without touching production.
+
+**The cost:** measured on the same machine, the versioned engine and one hour of history cost **13–29% of pipelined throughput**, and more disk for the old versions kept inside the window. Memory isn't affected. Turning history off (`-history 0`) still leaves a 7–21% cost from the versioned engine itself. Disk use grows with how often keys are overwritten times the window length, so for write-heavy cache workloads use `-history 0` or a shorter window such as `-history 10m`. Details are in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
+
 ## Features
 
+- **Time travel and branches** (above).
 - **Redis protocol (RESP2)** with pipelining and inline commands. 146 of 147 commands in a differential test returned byte-for-byte the same reply as Redis 7.0. Tested with `redis-cli` (including `--scan`, `--pipe` and `--latency`), `redis-py` and `go-redis`.
 - **Durable writes with group commit.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Concurrent writers share one `write` and one `fsync`. Torn writes from a crash are detected and discarded on recovery.
 - **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives). A sharded LRU **block cache** keeps hot blocks in memory.
@@ -93,6 +140,7 @@ make bench        # load test a running server
 | `-memtable-mb` | `4` | memtable size before it is flushed to an SSTable |
 | `-compaction-trigger` | `4` | number of SSTables before background compaction starts |
 | `-block-cache-mb` | `64` | memory for caching hot SSTable blocks (`0` disables) |
+| `-history` | `1h` | how far back `ASOF`, `HISTORY`, `ROLLBACK` and `BRANCH … ASOF` can reach (`0` keeps no history) |
 
 ### As a Go library
 
@@ -140,7 +188,11 @@ db.Scan([]byte("user:"), func(k []byte, it lsm.Item) bool {
 
 **Group commit.** After that step a writer releases its locks and waits for durability. The first waiter becomes the *leader*: it writes everything buffered so far with a single `write(2)` (plus a single `fsync` under `-fsync always`) and wakes the others. Under load, dozens of writes share one syscall. This is the leader/follower scheme RocksDB uses, combined with "early lock release". A concurrent reader can see a write a moment before it is durable, as in Redis, but no client is acknowledged until its write is durable. The log also keeps writes in order, so a crash can only lose a suffix of unacknowledged writes. With 50 clients and `-fsync always`, this took `SET` from 365 to about 11,000 ops/s. The server goes one step further, as Redis does with its AOF. It runs every command a client has pipelined, waits *once* for all of them to be durable, and only then sends the replies. One log write therefore covers whole pipelines from many clients, which more than doubled pipelined writes under `-fsync always`.
 
-**Read path.** Point lookups check the memtable, then frozen memtables, then each SSTable from newest to oldest, and stop at the first version found. A tombstone or an expired entry means "not found". Each SSTable keeps its index and Bloom filter in memory, so a lookup costs at most one 4 KiB block read per table that might contain the key, and none at all if the block is in the [block cache](internal/cache/cache.go). The cache is a 16-shard LRU keyed by (table, block); tables are immutable, so cached blocks never go stale. Scans and compactions read through the cache without filling it, so one big scan can't evict the hot set. Scans run a k-way heap merge over all sources and keep only the newest version of each key.
+**Versions (MVCC).** Every write gets a *version*: a hybrid timestamp with unix milliseconds in the high bits and a counter in the low 20 bits. Versions are handed out under the append lock, so they order writes exactly even if the system clock jumps backwards, and the last one is saved in the `MANIFEST`. All writes of one batch share a version, so a reader at any point in time sees a batch whole or not at all. The memtable and SSTables keep every version of a key, ordered by key and then newest version first. A read at time *T* seeks to the newest version at or before *T*; a read "now" is simply a read at the newest version. Flushes and compactions keep every version newer than the `-history` window, plus the one each key had when the window starts (that's what a read at the window's edge sees), and drop the rest.
+
+**Time travel on top.** `ASOF` runs a command through a read-only view of the keyspace at *T*, so hashes and sets come back as they were then, field by field. The compaction filter that removes a deleted hash's fields keeps them while any metadata version in the window still points to them. `ROLLBACK` walks the present and the past side by side and writes back every record that differs, as new versions. `BRANCH CREATE` flushes, then hard-links the parent's SSTables into a new directory. A branch of the past adds a per-table *version cutoff* to the new `MANIFEST` instead of rewriting data, and each side's compactions only ever remove their own links.
+
+**Read path.** Point lookups check the memtable, then frozen memtables, then each SSTable from newest to oldest, and stop at the first one holding a version of the key at or before the read point. A tombstone or an expired entry means "not found". Each SSTable keeps its index and Bloom filter in memory, so a lookup costs at most one 4 KiB block read per table that might contain the key, and none at all if the block is in the [block cache](internal/cache/cache.go). The cache is a 16-shard LRU keyed by (table, block); tables are immutable, so cached blocks never go stale. Scans and compactions read through the cache without filling it, so one big scan can't evict the hot set. Scans run a k-way heap merge over all sources and keep only the newest version of each key.
 
 **Compaction.** Tables form one sequence from newest to oldest. The compactor only merges *contiguous* runs, so the merged table can take the run's place without breaking that order. It picks a run by these rules ([`compaction.go`](lsm/compaction.go)):
 1. **Space amplification:** if the newer tables together are at least 2× the oldest, merge everything.
@@ -165,10 +217,13 @@ Every operation first reads the key's metadata to get its type and current *vers
 
 ```
 000017.wal     [crc32c(4) | len(4) | count | entry…] …
-000018.sst     [data block + crc]… [index block + crc] [bloom filter] [footer: offsets | count | magic]
-MANIFEST       {"next_file": 19, "tables": [18, 12, 5]}
-entry          kind(1) | expire_at_ms(uvarint) | key_len(uvarint) | key | val_len(uvarint) | value
+000018.sst     [data block + crc]… [index block + crc] [bloom filter] [footer: offsets | count | magic "EMBERKV2"]
+MANIFEST       {"format": 2, "next_file": 19, "last_version": …, "tables": [18, 12, 5], "cutoffs": {…}}
+entry          kind(1) | version(uvarint) | expire_at_ms(uvarint) | key_len(uvarint) | key | val_len(uvarint) | value
+branches/      one directory per branch, each a complete database
 ```
+
+Format 2 added versions. A data directory written by v0.1.0 (format 1) is refused with a clear error instead of being misread.
 
 ## Supported commands
 
@@ -181,7 +236,9 @@ entry          kind(1) | expire_at_ms(uvarint) | key_len(uvarint) | key | val_le
 | Sets | `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SINTER` `SUNION` `SDIFF` |
 | Expiry | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | Server | `PING` `ECHO` `SELECT 0` `INFO [section]` `TIME` `QUIT` `COMMAND` `CLIENT` `CONFIG GET` |
-| emberkv | `COMPACT`: flush and fully compact, reclaiming space |
+| Time travel | `ASOF <time> <command…>` `HISTORY <key> [COUNT n]` `ROLLBACK <time>` |
+| Branches | `BRANCH CREATE <name> [ASOF <time>]` `BRANCH USE <name>` `BRANCH CURRENT` `BRANCH LIST` `BRANCH DROP <name>` |
+| emberkv | `COMPACT`: flush and fully compact, reclaiming space outside the history window |
 
 Strings, hashes and sets are supported, with Redis's `WRONGTYPE` errors. Lists and sorted sets are on the roadmap. There is a single database: `SELECT` accepts only `0`, as in Redis Cluster.
 
@@ -205,14 +262,15 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 
 | | emberkv | Redis (AOF everysec) | Kvrocks | Dragonfly |
 |---|---|---|---|---|
-| `SET` req/s, pipeline 1 | 53k | 78k | 30k | 40k |
-| `GET` req/s, pipeline 1 | 55k | 74k | 44k | 40k |
-| `SET` req/s, pipeline 16 | 237k | 452k | 60k | 435k |
-| `GET` req/s, pipeline 16 | 597k | 907k | 319k | 471k |
-| Memory for 632k keys | **50 MiB** | 147 MiB | 254 MiB | 140 MiB |
+| `SET` req/s, pipeline 1 | 53k | 68k | 36k | 40k |
+| `GET` req/s, pipeline 1 | 54k | 65k | 46k | 40k |
+| `SET` req/s, pipeline 16 | 227k | 456k | 67k | 452k |
+| `GET` req/s, pipeline 16 | 490k | 780k | 340k | 471k |
+| Memory for 632k keys | **58 MiB** | 139 MiB | 268 MiB | 139 MiB |
 | Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
+| Time travel and branches | **yes** | no | no | no |
 
-Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis. Per-key locks, a block cache and one durability wait per pipeline raised pipelined throughput by up to **+235%** (see [before/after](BENCHMARKS.md#speed-fixes-before-vs-after)).
+emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.4× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
 
 ### On an Apple M2 Pro
 
@@ -244,6 +302,9 @@ Effect of group commit on writes (pipeline 1):
 - [x] Lock-only batch path for blind writes (`MSET`, `SET`, `FLUSHALL`)
 - [ ] Find the remaining ~10% `MSET` gap at pipeline 1 with `fsync everysec`
 - [x] Hashes and sets, encoded as composite keys over the same LSM (Kvrocks-style)
+- [x] Versioned history (MVCC) with `ASOF`, `HISTORY`, `ROLLBACK` and instant `BRANCH`es
+- [ ] Merge a branch back into its parent
+- [ ] `HISTORY` for individual hash fields and set members
 - [ ] Lists and sorted sets
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
 - [ ] Key-prefix compression inside blocks
