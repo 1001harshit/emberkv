@@ -1,0 +1,42 @@
+name: Benchmark
+
+# Compares emberkv with Redis, Kvrocks and Dragonfly: compatibility,
+# throughput, memory/disk footprint and crash safety. Run it from the
+# Actions tab; the report appears in the run summary and as an artifact.
+on:
+  workflow_dispatch:
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build emberkv
+        run: go build -o bin/ ./cmd/...
+      - name: Install Redis, its tools and the Python client
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q redis-server redis-tools
+          sudo systemctl stop redis-server || true
+          sudo systemctl disable redis-server || true
+          pip install redis==5.2.1
+      - name: Pull Kvrocks and Dragonfly
+        run: |
+          docker pull -q apache/kvrocks:latest
+          docker pull -q docker.dragonflydb.io/dragonflydb/dragonfly:latest
+      - name: Compare
+        run: python bench/compare.py --emberkv bin/emberkv --out results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: |
+            results/
+            /tmp/emberkv-bench/*.log

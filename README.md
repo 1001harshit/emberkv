@@ -29,7 +29,7 @@ OK
 
 ## Features
 
-- **Redis protocol (RESP2)** with pipelining and inline commands. Verified with [`go-redis`](https://github.com/redis/go-redis), including pipelines, `SCAN` iterators and TTLs. Other RESP2 clients such as `redis-cli` and `redis-py` should work too, since they speak the same protocol, but they haven't been tested yet.
+- **Redis protocol (RESP2)** with pipelining and inline commands. 146 of 147 commands in a differential test returned byte-for-byte the same reply as Redis 7.0. Tested with `redis-cli` (including `--scan`, `--pipe` and `--latency`), `redis-py` and `go-redis`.
 - **Durable writes with group commit.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Concurrent writers share one `write` and one `fsync`. Torn writes from a crash are detected and discarded on recovery.
 - **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives).
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
@@ -179,7 +179,7 @@ entry          kind(1) | expire_at_ms(uvarint) | key_len(uvarint) | key | val_le
 | Server | `PING` `ECHO` `SELECT 0` `INFO [section]` `TIME` `QUIT` `COMMAND` `CLIENT` `CONFIG GET` |
 | emberkv | `COMPACT`: flush and fully compact, reclaiming space |
 
-Strings, hashes and sets are supported, with Redis's `WRONGTYPE` errors. Lists and sorted sets are on the roadmap.
+Strings, hashes and sets are supported, with Redis's `WRONGTYPE` errors. Lists and sorted sets are on the roadmap. There is a single database: `SELECT` accepts only `0`, as in Redis Cluster.
 
 ## Testing
 
@@ -195,7 +195,23 @@ go test -race ./...
 
 ## Benchmarks
 
-`emberbench` is a small `redis-benchmark`-style load generator. It was run with 50 clients, 64-byte values and 100k keys, on an Apple M2 Pro:
+### Compared with Redis, Kvrocks and Dragonfly
+
+From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub runner with `redis-benchmark`. Full tables, method and caveats are in **[BENCHMARKS.md](BENCHMARKS.md)**.
+
+| | emberkv | Redis (AOF everysec) | Kvrocks | Dragonfly |
+|---|---|---|---|---|
+| `SET` req/s, pipeline 1 | 53k | 85k | 30k | 41k |
+| `GET` req/s, pipeline 1 | 53k | 82k | 44k | 41k |
+| `SET` req/s, pipeline 16 | 223k | 488k | 59k | 426k |
+| Memory for 632k keys | **46 MiB** | 144 MiB | 168 MiB | 96 MiB |
+| Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
+
+Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis.
+
+### On an Apple M2 Pro
+
+`emberbench` is a small `redis-benchmark`-style load generator, run with 50 clients, 64-byte values and 100k keys, on an Apple M2 Pro:
 
 | Test (`-fsync everysec`) | Pipeline 1 | Pipeline 16 |
 |---|---|---|
@@ -218,6 +234,7 @@ Effect of group commit on writes (pipeline 1):
 
 - [x] Group commit: batch concurrent writers into one WAL write and fsync
 - [ ] Block cache for hot SSTable blocks
+- [ ] Striped per-key locks so pipelined `INCR`/`HSET`/`SADD` don't serialize on one write lock
 - [x] Hashes and sets, encoded as composite keys over the same LSM (Kvrocks-style)
 - [ ] Lists and sorted sets
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
