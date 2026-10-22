@@ -1,0 +1,47 @@
+# Installs the published release the way users do and checks it works.
+name: Install check
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  homebrew:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@master
+      - run: brew install 1001harshit/tap/emberkv
+      - run: emberkv -version
+      - run: brew test emberkv
+      - name: Serve and answer a command
+        run: |
+          emberkv -dir "$RUNNER_TEMP/data" &
+          sleep 1
+          printf 'SET hello world\r\nGET hello\r\n' | nc -w 2 127.0.0.1 6380 | tee out.txt
+          grep -q world out.txt
+
+  curl:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: curl -fsSL https://raw.githubusercontent.com/1001harshit/emberkv/main/install.sh | EMBERKV_INSTALL_DIR="$HOME/bin" sh
+      - run: $HOME/bin/emberkv -version
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker run -d --name emberkv -p 6380:6380 ghcr.io/1001harshit/emberkv:latest
+      - run: |
+          sleep 2
+          printf 'HSET h f v\r\nHGET h f\r\n' | nc -w 2 127.0.0.1 6380 | tee out.txt
+          grep -q '^v' out.txt
+      - if: failure()
+        run: docker logs emberkv
