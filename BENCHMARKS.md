@@ -7,8 +7,9 @@ the Actions tab. Run on 2026-10-23:
 - **Machine:** GitHub-hosted runner, 4 vCPU x86_64, Ubuntu 24.04. The servers and
   the load generator shared the machine.
 - **Load:** `redis-benchmark` with 50 clients, 64-byte values and 100k random keys.
-- **Versions:** emberkv at `d161fa7`, Redis 7.0.15 (Ubuntu package), `apache/kvrocks:latest`,
-  `dragonflydb/dragonfly:latest`, all with default settings except the persistence options listed.
+- **Versions:** emberkv at `7de7042`, Redis 7.0.15 (Ubuntu package),
+  `apache/kvrocks:latest`, `dragonflydb/dragonfly:latest`, all with default settings
+  except the persistence options listed.
 
 | Server | What it is |
 |---|---|
@@ -20,55 +21,94 @@ the Actions tab. Run on 2026-10-23:
 ## Summary
 
 - **Crash safety:** like Redis with AOF and Kvrocks, emberkv lost **zero** acknowledged writes
-  when killed with `kill -9`. Redis in its default configuration lost **all 34,481**.
+  when killed with `kill -9`. Redis in its default configuration lost **all 34,157**.
 - **Memory:** emberkv used the least memory, about **3× less than Redis** for the same data,
   because the data lives on disk. It also used the least disk.
-- **vs Kvrocks** (the fair comparison): emberkv is **1.5–2× faster** at pipeline 1 for every
-  command, and up to **3.8× faster** for pipelined `SET`. Kvrocks is faster for pipelined
-  `HSET` and `SADD`.
-- **vs Redis:** Redis is faster, about 1.5× at pipeline 1 and 3–12× when pipelined, as expected
-  for a mature in-memory C server. With equal durability (fsync on every write), single
-  writes are about even: `SET` 43.9k/s for emberkv vs 42.9k/s for Redis.
+- **vs Kvrocks** (the fair comparison): emberkv is **1.2–1.7× faster** at pipeline 1. Pipelined,
+  it is up to **4× faster for `SET`** and **1.7× for `GET`**. It roughly ties on `HSET`, and
+  Kvrocks is ahead on pipelined `SADD`.
+- **vs Redis:** Redis is still faster, as an in-memory C server should be: about 1.5× at
+  pipeline 1, and 1.6–8× pipelined.
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
   checks passed (`--scan`, `--pipe`, stdin mode, `--latency`), and the comparison itself
   was driven through `redis-py`.
 
+## Speed fixes: before vs after
+
+Three changes, measured old build against new build in the **same run on the same machine**
+(baseline `015c9b5`):
+
+1. **[Striped per-key locks](lsm/locks.go).** Read-modify-write commands on different keys no
+   longer wait for each other. Only the step that appends to the log buffer stays serial.
+2. **[Block cache](internal/cache/cache.go).** A 64 MiB sharded LRU of verified SSTable blocks,
+   so hot reads skip the system call, the allocation and the checksum.
+3. **One durability wait per pipeline.** Profiling showed the WAL `write(2)` was the next
+   bottleneck: each connection waited for the disk after every command. Like Redis, the server
+   now runs every command it has read, waits once for all of them to be durable, and only then
+   replies.
+
+| fsync | pipeline | SET | GET | INCR | HSET | SADD | MSET |
+|---|---|---|---|---|---|---|---|
+| always | 16 | 84.8k → **237k (+180%)** | 324k → **572k (+76%)** | 73.1k → **136k (+86%)** | 60.2k → **110k (+83%)** | 62.8k → **111k (+76%)** | 37.2k → 37.0k (−1%) |
+| everysec | 16 | 229k → 221k (−3%) | 328k → **568k (+73%)** | 92.4k → **126k (+37%)** | 71.9k → **102k (+42%)** | 75.3k → **103k (+37%)** | 41.9k → 38.3k (**−9%**) |
+| always | 1 | 46.1k → 46.1k (0%) | 54.2k → 55.5k (+2%) | 46.5k → 45.9k (−1%) | 39.9k → 42.8k (+7%) | 41.9k → 43.6k (+4%) | 27.6k → 27.8k (+1%) |
+| everysec | 1 | 54.2k → 53.6k (−1%) | 54.1k → 55.0k (+2%) | 54.2k → 53.1k (−2%) | 50.5k → 52.2k (+3%) | 51.5k → 52.8k (+3%) | 35.8k → 30.3k (**−15%**) |
+
+How to read it:
+
+- **Pipelined writes with `fsync always`** gained the most, because each disk write and fsync
+  now covers a whole pipeline from every client. With full durability, the gap to Redis with
+  `AOF always` on pipelined `SET` narrowed from 4.1× (85k vs 345k) to 1.5× (237k vs 345k),
+  and emberkv is now 4× faster than Kvrocks there.
+- **Pipelined `GET`** gained 73–76% from the block cache.
+- **Pipeline 1 is unchanged**, as expected: there, each request waits on a network round trip,
+  not on locks or disk.
+- **`MSET` regressed 9–15% with `everysec`.** It now takes ten key locks and builds a small
+  transaction map instead of writing a plain batch. A lock-only batch path would fix it;
+  that is not done yet.
+
+On an Apple M2 Pro (10 cores, `emberbench`, pipeline 16) the gains were larger:
+`fsync always` `INCR` 14.7k → 188k, and `GET` 618k → 1.55M.
+
 ## Throughput, pipeline 1 (requests/s)
 
 | Server | SET | GET | INCR | HSET | SADD | MSET |
 |---|---|---|---|---|---|---|
-| **emberkv (fsync everysec)** | 53,079 | 52,924 | 52,383 | 47,778 | 49,652 | 35,032 |
-| **emberkv (fsync always)** | 43,927 | 53,433 | 44,504 | 38,700 | 40,858 | 26,378 |
-| Redis (default: RDB snapshots) | 77,489 | 75,472 | 76,307 | 79,872 | 75,901 | 78,771 |
-| Redis (AOF everysec) | 84,926 | 81,566 | 84,818 | 85,143 | 83,717 | 53,519 |
-| Redis (AOF always) | 42,872 | 74,710 | 48,900 | 43,697 | 51,800 | 31,221 |
-| Kvrocks | 29,735 | 43,754 | 29,878 | 29,193 | 32,441 | 17,926 |
-| Dragonfly | 40,502 | 40,535 | 40,833 | 41,110 | 41,736 | 32,410 |
+| **emberkv (fsync everysec)** | 53,591 | 55,006 | 53,064 | 52,219 | 52,840 | 30,321 |
+| **emberkv (fsync always)** | 46,051 | 55,525 | 45,914 | 42,790 | 43,620 | 27,828 |
+| Redis (default: RDB snapshots) | 78,927 | 77,760 | 78,493 | 79,460 | 78,401 | 77,340 |
+| Redis (AOF everysec) | 81,800 | 78,802 | 82,102 | 83,056 | 80,386 | 55,695 |
+| Redis (AOF always) | 50,050 | 77,851 | 54,127 | 49,322 | 55,741 | 32,669 |
+| Kvrocks | 31,240 | 44,484 | 31,211 | 30,012 | 33,107 | 18,300 |
+| Dragonfly | 40,659 | 41,059 | 41,195 | 41,911 | 42,105 | 33,630 |
 
 ## Throughput, pipeline 16 (requests/s)
 
 | Server | SET | GET | INCR | HSET | SADD | MSET |
 |---|---|---|---|---|---|---|
-| **emberkv (fsync everysec)** | 222,767 | 312,305 | 87,481 | 70,190 | 73,099 | 40,422 |
-| **emberkv (fsync always)** | 79,942 | 305,157 | 67,069 | 57,136 | 58,194 | 35,947 |
-| Redis (default: RDB snapshots) | 838,223 | 992,064 | 1,009,082 | 851,064 | 1,052,632 | 202,675 |
-| Redis (AOF everysec) | 487,805 | 956,023 | 660,502 | 466,636 | 981,354 | 122,579 |
-| Redis (AOF always) | 325,098 | 841,751 | 394,322 | 331,126 | 698,812 | 95,274 |
-| Kvrocks | 58,862 | 318,573 | 59,130 | 102,512 | 125,109 | 28,441 |
-| Dragonfly | 425,532 | 459,982 | 462,749 | 426,439 | 488,520 | 122,805 |
+| **emberkv (fsync everysec)** | 221,043 | 568,182 | 126,454 | 102,229 | 103,466 | 38,266 |
+| **emberkv (fsync always)** | 237,417 | 571,755 | 135,962 | 109,938 | 110,668 | 37,032 |
+| Redis (default: RDB snapshots) | 729,927 | 927,644 | 1,004,016 | 825,764 | 982,318 | 197,161 |
+| Redis (AOF everysec) | 447,027 | 910,747 | 653,595 | 424,088 | 932,836 | 123,274 |
+| Redis (AOF always) | 344,947 | 818,331 | 433,276 | 361,533 | 684,932 | 107,910 |
+| Kvrocks | 59,816 | 327,761 | 60,339 | 106,519 | 125,739 | 28,873 |
+| Dragonfly | 435,920 | 473,261 | 476,644 | 456,830 | 514,668 | 126,534 |
 
 ## Latency, pipeline 1 (p50 / p99 ms)
 
 | Server | SET | GET | HSET |
 |---|---|---|---|
-| **emberkv (fsync everysec)** | 0.50 / 1.22 | 0.50 / 1.32 | 0.55 / 3.54 |
-| **emberkv (fsync always)** | 0.84 / 3.20 | 0.50 / 1.42 | 0.96 / 4.08 |
-| Redis (default: RDB snapshots) | 0.33 / 0.52 | 0.34 / 0.53 | 0.32 / 0.47 |
-| Redis (AOF everysec) | 0.30 / 0.47 | 0.31 / 0.47 | 0.30 / 0.43 |
-| Redis (AOF always) | 1.02 / 3.08 | 0.34 / 0.55 | 1.01 / 2.81 |
-| Kvrocks | 1.44 / 4.11 | 0.86 / 2.74 | 1.41 / 5.23 |
-| Dragonfly | 0.84 / 2.56 | 0.82 / 2.62 | 0.84 / 2.58 |
+| **emberkv (fsync everysec)** | 0.49 / 1.26 | 0.49 / 0.97 | 0.52 / 2.16 |
+| **emberkv (fsync always)** | 0.81 / 1.95 | 0.49 / 0.96 | 0.90 / 2.24 |
+| Redis (default: RDB snapshots) | 0.32 / 0.51 | 0.33 / 0.51 | 0.32 / 0.43 |
+| Redis (AOF everysec) | 0.31 / 0.52 | 0.33 / 0.42 | 0.31 / 0.41 |
+| Redis (AOF always) | 0.90 / 1.68 | 0.33 / 0.50 | 0.91 / 1.55 |
+| Kvrocks | 1.34 / 4.03 | 0.85 / 2.69 | 1.30 / 5.58 |
+| Dragonfly | 0.84 / 2.60 | 0.83 / 2.53 | 0.82 / 2.54 |
+
+The fixes also cut emberkv's tail latency: p99 for `GET` fell from 1.54 to 0.97 ms, and for
+`HSET` from 3.38 to 2.16 ms.
 
 ## Memory and disk
 
@@ -77,13 +117,13 @@ about 632k distinct keys. Memory is the process RSS (container memory for Docker
 
 | Server | Keys | Memory | Disk |
 |---|---|---|---|
-| **emberkv (fsync everysec)** | 632,202 | **46 MiB** | **94 MiB** |
-| Redis (AOF everysec) | 632,342 | 144 MiB | 115 MiB |
-| Kvrocks | 632,174 | 168 MiB | 218 MiB |
-| Dragonfly | 631,541 | 96 MiB | n/a (no persistence) |
+| **emberkv (fsync everysec)** | 632,351 | **46 MiB** | **94 MiB** |
+| Redis (AOF everysec) | 632,082 | 144 MiB | 116 MiB |
+| Kvrocks | 632,060 | 169 MiB | 218 MiB |
+| Dragonfly | 632,249 | 96 MiB | n/a (no persistence) |
 
-emberkv's memory is bounded by the memtable, plus each SSTable's sparse index and Bloom filter,
-not by the size of the data. Redis must hold everything in RAM.
+emberkv's memory is bounded by the memtable, the block cache (64 MiB at most), and each SSTable's
+sparse index and Bloom filter, not by the size of the data. Redis must hold everything in RAM.
 
 ## Crash safety
 
@@ -92,32 +132,36 @@ and restarted, and every acknowledged key is read back.
 
 | Server | Acknowledged writes | Lost after restart |
 |---|---|---|
-| **emberkv (fsync always)** | 8,546 | **0** |
-| **emberkv (fsync everysec)** | 29,582 | **0** |
-| Redis (default: RDB snapshots) | 34,481 | **34,481 (all)** |
-| Redis (AOF everysec) | 34,087 | 0 |
-| Redis (AOF always) | 9,183 | 0 |
-| Kvrocks | 15,993 | 0 |
+| **emberkv (fsync always)** | 9,187 | **0** |
+| **emberkv (fsync everysec)** | 28,477 | **0** |
+| Redis (default: RDB snapshots) | 34,157 | **34,157 (all)** |
+| Redis (AOF everysec) | 33,281 | 0 |
+| Redis (AOF always) | 9,597 | 0 |
+| Kvrocks | 16,150 | 0 |
+
+Because replies to a pipeline are now held until the whole batch is durable, this was also
+checked with 8 pipelining clients (16 commands per batch). Across about 1.6 million acknowledged
+pipelined writes, none were lost.
 
 A process kill doesn't simulate power loss, because data already handed to the OS survives
 it. Under power loss, `fsync everysec` (emberkv and Redis alike) can lose up to about a second
 of writes, while `fsync always` loses nothing it acknowledged.
 
-## Where emberkv is slower, and why
+## Where emberkv is still slower, and why
 
-- **Pipelined read-modify-write (`INCR`, `HSET`, `SADD`: about 70–90k/s).** Each one takes the
-  global write lock and then reads through the LSM layers (memtable, frozen memtables,
-  SSTables) before writing, so they run one at a time. Plain `SET` is a blind write and
-  reaches about 223k/s. Next steps: striped per-key locks and a memtable-first fast path.
-- **Pipelined `GET` (about 312k/s vs Redis's 1M/s).** Redis serves from a hash table in RAM
-  with one thread and no locks. emberkv checks the memtable, Bloom filters and SSTable blocks,
-  and has no block cache yet; adding one is on the roadmap.
+- **Pipelined read-modify-write (`INCR`, `HSET`, `SADD`: about 100–135k/s vs Redis's 400k–1M).**
+  Each one still reads through the LSM layers before writing, and every write takes the
+  memtable's single exclusive lock. A concurrent (lock-free) skip list is the next step.
+- **Pipelined `GET` (about 570k/s vs Redis's 900k/s).** The remaining cost is checking the
+  memtable and Bloom filters, decoding blocks, and Go's per-connection overhead.
+- **`MSET`:** see the regression above.
 - **One database.** `SELECT` accepts only `0`, as in Redis Cluster.
 
 ## Caveats
 
-- **Shared machine:** a 4 vCPU shared VM with the client on the same host, so absolute numbers are
-  noisy. Compare the rows with each other rather than trusting any single figure.
-- **Dragonfly is disadvantaged:** it is built to scale across many cores. On 4 vCPUs that it shares
-  with the client, this test does not show it at its best.
+- **Shared machine:** a 4 vCPU shared VM with the client on the same host, so absolute numbers
+  are noisy. The before/after table is the most reliable part, because both builds ran in the
+  same job.
+- **Dragonfly is disadvantaged:** it is built to scale across many cores. On 4 vCPUs that it
+  shares with the client, this test does not show it at its best.
 - **Redis version:** 7.0.15 from Ubuntu's package, not the latest Redis.

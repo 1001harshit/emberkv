@@ -31,7 +31,8 @@ OK
 
 - **Redis protocol (RESP2)** with pipelining and inline commands. 146 of 147 commands in a differential test returned byte-for-byte the same reply as Redis 7.0. Tested with `redis-cli` (including `--scan`, `--pipe` and `--latency`), `redis-py` and `go-redis`.
 - **Durable writes with group commit.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Concurrent writers share one `write` and one `fsync`. Torn writes from a crash are detected and discarded on recovery.
-- **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives).
+- **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives). A sharded LRU **block cache** keeps hot blocks in memory.
+- **Parallel writes.** Striped per-key locks let read-modify-write commands on different keys run concurrently. Each client pipeline is made durable with one wait, as in Redis.
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
 - **Strings, hashes and sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field or member. Deleting or expiring a hash of any size is a single write, and a compaction filter later reclaims the orphaned fields.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
@@ -91,6 +92,7 @@ make bench        # load test a running server
 | `-fsync` | `everysec` | `always`: fsync every write, so nothing acknowledged is ever lost. `everysec`: lose at most about 1s of writes. `no`: leave it to the OS |
 | `-memtable-mb` | `4` | memtable size before it is flushed to an SSTable |
 | `-compaction-trigger` | `4` | number of SSTables before background compaction starts |
+| `-block-cache-mb` | `64` | memory for caching hot SSTable blocks (`0` disables) |
 
 ### As a Go library
 
@@ -134,9 +136,11 @@ db.Scan([]byte("user:"), func(k []byte, it lsm.Item) bool {
 
 **Write path.** Every write, or batch of writes, becomes a single WAL record (`crc32c | length | entries`) and is then inserted into the skip list. When the memtable reaches its size limit it is frozen. A new memtable and WAL take over, and a background goroutine writes the frozen one out as an SSTable. Once the new table is listed in the `MANIFEST`, which is replaced atomically via write-temp-then-rename, the old WAL is deleted. If flushing falls behind, writers stall instead of letting memory grow without limit.
 
-**Group commit.** Writers hold the write lock only long enough to encode their record into an in-memory log buffer and apply it to the memtable. Then they release the lock and wait for durability. The first waiter becomes the *leader*: it writes everything buffered so far with a single `write(2)` (plus a single `fsync` under `-fsync always`) and wakes the others. Under load, dozens of writes share one syscall. This is the leader/follower scheme RocksDB uses, combined with "early lock release". A concurrent reader can see a write a moment before it is durable, as in Redis, but no client is acknowledged until its write is durable. The log also keeps writes in order, so a crash can only lose a suffix of unacknowledged writes. With 50 clients and `-fsync always`, this took `SET` from 365 to about 11,000 ops/s.
+**Concurrency.** A writer locks only its own key: one of 256 [striped locks](lsm/locks.go), picked by hashing the key. So `INCR a` and `INCR b` do their reads and logic in parallel, while two `INCR a` still run one after the other. Blind writes like `SET` take the key lock too, so they can't slip between another command's read and write. The only globally serial step is a short critical section that appends the record to the in-memory log buffer and the memtable, which keeps the log in execution order.
 
-**Read path.** Point lookups check the memtable, then frozen memtables, then each SSTable from newest to oldest, and stop at the first version found. A tombstone or an expired entry means "not found". Each SSTable keeps its index and Bloom filter in memory, so a lookup costs at most one 4 KiB block read per table that might contain the key. Scans run a k-way heap merge over all sources and keep only the newest version of each key.
+**Group commit.** After that step a writer releases its locks and waits for durability. The first waiter becomes the *leader*: it writes everything buffered so far with a single `write(2)` (plus a single `fsync` under `-fsync always`) and wakes the others. Under load, dozens of writes share one syscall. This is the leader/follower scheme RocksDB uses, combined with "early lock release". A concurrent reader can see a write a moment before it is durable, as in Redis, but no client is acknowledged until its write is durable. The log also keeps writes in order, so a crash can only lose a suffix of unacknowledged writes. With 50 clients and `-fsync always`, this took `SET` from 365 to about 11,000 ops/s. The server goes one step further, as Redis does with its AOF. It runs every command a client has pipelined, waits *once* for all of them to be durable, and only then sends the replies. One log write therefore covers whole pipelines from many clients, which more than doubled pipelined writes under `-fsync always`.
+
+**Read path.** Point lookups check the memtable, then frozen memtables, then each SSTable from newest to oldest, and stop at the first version found. A tombstone or an expired entry means "not found". Each SSTable keeps its index and Bloom filter in memory, so a lookup costs at most one 4 KiB block read per table that might contain the key, and none at all if the block is in the [block cache](internal/cache/cache.go). The cache is a 16-shard LRU keyed by (table, block); tables are immutable, so cached blocks never go stale. Scans and compactions read through the cache without filling it, so one big scan can't evict the hot set. Scans run a k-way heap merge over all sources and keep only the newest version of each key.
 
 **Compaction.** Tables form one sequence from newest to oldest. The compactor only merges *contiguous* runs, so the merged table can take the run's place without breaking that order. It picks a run by these rules ([`compaction.go`](lsm/compaction.go)):
 1. **Space amplification:** if the newer tables together are at least 2× the oldest, merge everything.
@@ -201,13 +205,14 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 
 | | emberkv | Redis (AOF everysec) | Kvrocks | Dragonfly |
 |---|---|---|---|---|
-| `SET` req/s, pipeline 1 | 53k | 85k | 30k | 41k |
-| `GET` req/s, pipeline 1 | 53k | 82k | 44k | 41k |
-| `SET` req/s, pipeline 16 | 223k | 488k | 59k | 426k |
+| `SET` req/s, pipeline 1 | 54k | 82k | 31k | 41k |
+| `GET` req/s, pipeline 1 | 55k | 79k | 44k | 41k |
+| `SET` req/s, pipeline 16 | 221k | 447k | 60k | 436k |
+| `GET` req/s, pipeline 16 | 568k | 911k | 328k | 473k |
 | Memory for 632k keys | **46 MiB** | 144 MiB | 168 MiB | 96 MiB |
 | Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
 
-Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis.
+Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis. Per-key locks, a block cache and one durability wait per pipeline raised pipelined throughput by up to **+180%** (see [before/after](BENCHMARKS.md#speed-fixes-before-vs-after)).
 
 ### On an Apple M2 Pro
 
@@ -233,8 +238,10 @@ Effect of group commit on writes (pipeline 1):
 ## Roadmap
 
 - [x] Group commit: batch concurrent writers into one WAL write and fsync
-- [ ] Block cache for hot SSTable blocks
-- [ ] Striped per-key locks so pipelined `INCR`/`HSET`/`SADD` don't serialize on one write lock
+- [x] Block cache for hot SSTable blocks
+- [x] Striped per-key locks so pipelined `INCR`/`HSET`/`SADD` don't serialize on one write lock
+- [ ] Lock-free skip-list memtable (the next write bottleneck)
+- [ ] Lock-only batch path for `MSET` (regressed 9–15% with per-key locks)
 - [x] Hashes and sets, encoded as composite keys over the same LSM (Kvrocks-style)
 - [ ] Lists and sorted sets
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
