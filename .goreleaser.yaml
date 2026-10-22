@@ -1,0 +1,93 @@
+# Builds release binaries, archives, checksums, the Homebrew formula and
+# Docker images. Run by .github/workflows/release.yml when a v* tag is pushed.
+# Try it locally with: goreleaser release --snapshot --clean --skip=docker
+version: 2
+project_name: emberkv
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - &build
+    id: emberkv
+    main: ./cmd/emberkv
+    binary: emberkv
+    env: [CGO_ENABLED=0]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X github.com/1001harshit/emberkv/server.Version={{ .Version }}
+  - <<: *build
+    id: emberbench
+    main: ./cmd/emberbench
+    binary: emberbench
+
+archives:
+  # No version in the name, so .../releases/latest/download/<name> always works.
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [README.md, LICENSE]
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^ci:", "^docs:", "^test:"]
+
+# A Homebrew *formula* rather than a cask, even though GoReleaser marks
+# `brews` as deprecated: formulas work on Linux too, support
+# `brew services start emberkv` like Redis does, and are not blocked by
+# Gatekeeper the way unsigned cask binaries are.
+brews:
+  - name: emberkv
+    repository:
+      owner: 1001harshit
+      name: homebrew-tap
+      token: '{{ envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "" }}'
+    # Publishing the formula needs a token that can push to the tap repo;
+    # without one the rest of the release still goes out.
+    skip_upload: '{{ if eq (envOrDefault "HOMEBREW_TAP_GITHUB_TOKEN" "") "" }}true{{ else }}auto{{ end }}'
+    directory: Formula
+    homepage: https://github.com/1001harshit/emberkv
+    description: Persistent, Redis-compatible key-value database built on an LSM tree
+    license: MIT
+    install: |
+      bin.install "emberkv"
+      bin.install "emberbench"
+    # `brew services start emberkv`, like Redis.
+    service: |
+      run [opt_bin/"emberkv", "-dir", var/"emberkv"]
+      keep_alive true
+      working_dir var
+      log_path var/"log/emberkv.log"
+      error_log_path var/"log/emberkv.log"
+    caveats: |
+      Start emberkv now and at login:
+        brew services start emberkv
+      Or run it in the foreground:
+        emberkv -dir #{var}/emberkv
+      It listens on 127.0.0.1:6380; connect with any Redis client.
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/emberkv -version")
+
+dockers_v2:
+  - ids: [emberkv]
+    dockerfile: Dockerfile.release
+    images: ["ghcr.io/1001harshit/emberkv"]
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    platforms: [linux/amd64, linux/arm64]
+    labels:
+      "org.opencontainers.image.source": "https://github.com/1001harshit/emberkv"
+      "org.opencontainers.image.description": "Persistent, Redis-compatible key-value database"
+      "org.opencontainers.image.licenses": "MIT"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"

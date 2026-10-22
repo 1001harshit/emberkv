@@ -38,26 +38,50 @@ OK
 - **Atomic multi-key transactions.** `MSET` is all-or-nothing even across a crash. `INCR`, `SET NX`, `HSET`, `HINCRBY`, `SADD` and the rest are atomic.
 - **Embeddable.** The `lsm` package is a standalone Go key-value store, and `keyspace` adds Redis types on top. Neither needs the server.
 
-## Quick start
+## Install
+
+**Homebrew** (macOS and Linux), the same way you'd install Redis:
 
 ```bash
-go install github.com/1001harshit/emberkv/cmd/emberkv@latest
-emberkv -dir ./data
+brew install 1001harshit/tap/emberkv
+brew services start emberkv        # runs in the background and starts at login
 ```
 
-Or from a clone:
+**One-line installer** (macOS and Linux). It picks the right build for your machine and verifies its SHA-256 checksum:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/1001harshit/emberkv/main/install.sh | sh
+```
+
+**Docker** (amd64 and arm64):
+
+```bash
+docker run -d --name emberkv -p 6380:6380 -v emberkv-data:/data ghcr.io/1001harshit/emberkv
+```
+
+**Windows, or by hand:** download the archive for your platform from the [releases page](https://github.com/1001harshit/emberkv/releases/latest).
+
+**From source:** `go install github.com/1001harshit/emberkv/cmd/emberkv@latest`
+
+Then connect with any Redis client:
+
+```bash
+redis-cli -p 6380
+```
+
+### Running it
+
+```bash
+emberkv -dir ~/.emberkv          # foreground, data in ~/.emberkv
+emberkv -version
+```
+
+From a clone of this repo:
 
 ```bash
 make run          # build and start on 127.0.0.1:6380
 make test         # unit + integration tests with the race detector
 make bench        # load test a running server
-```
-
-With Docker:
-
-```bash
-docker build -t emberkv .
-docker run -p 6380:6380 -v emberkv-data:/data emberkv
 ```
 
 | Flag | Default | Meaning |
@@ -200,6 +224,7 @@ Effect of group commit on writes (pipeline 1):
 - [ ] Key-prefix compression inside blocks
 - [ ] Replication via WAL shipping
 - [ ] `AUTH` and TLS
+- [x] Release builds for Linux, macOS and Windows, a Homebrew tap, a curl installer and a Docker image
 
 ## License
 

@@ -16,8 +16,9 @@ import (
 	"github.com/1001harshit/emberkv/keyspace"
 )
 
-// Version is reported by INFO.
-const Version = "0.1.0"
+// Version is reported by INFO and -version. Release builds set it with
+// -ldflags "-X github.com/1001harshit/emberkv/server.Version=...".
+var Version = "dev"
 
 // Server serves Redis-protocol clients from one database.
 type Server struct {

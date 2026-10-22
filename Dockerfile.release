@@ -1,0 +1,9 @@
+# Used by GoReleaser (dockers_v2), which puts each platform's prebuilt binary
+# under $TARGETPLATFORM/ in the build context. To build from source, use the
+# plain Dockerfile.
+FROM gcr.io/distroless/static
+ARG TARGETPLATFORM
+COPY $TARGETPLATFORM/emberkv /usr/local/bin/emberkv
+VOLUME /data
+EXPOSE 6380
+ENTRYPOINT ["/usr/local/bin/emberkv", "-addr", "0.0.0.0:6380", "-dir", "/data"]
