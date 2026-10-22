@@ -25,7 +25,7 @@ func main() {
 	pipeline := flag.Int("P", 1, "commands pipelined per round trip")
 	size := flag.Int("d", 64, "value size in bytes")
 	keyspace := flag.Int("r", 100000, "number of distinct keys")
-	tests := flag.String("t", "set,get", "comma-separated tests: set, get, incr, hset, hget, sadd, mixed")
+	tests := flag.String("t", "set,get", "comma-separated tests: set, get, incr, mset, hset, hget, sadd, mixed")
 	flag.Parse()
 
 	value := strings.Repeat("x", *size)
@@ -55,6 +55,12 @@ func command(test string, rnd *rand.Rand, keyspace int, value string) []string {
 	case "sadd":
 		n := rnd.Intn(keyspace)
 		return []string{"SADD", "set:" + strconv.Itoa(n%1000), "member:" + strconv.Itoa(n)}
+	case "mset": // 10 keys per command, like redis-benchmark
+		args := []string{"MSET"}
+		for i := 0; i < 10; i++ {
+			args = append(args, "key:"+strconv.Itoa(rnd.Intn(keyspace)), value)
+		}
+		return args
 	case "mixed": // 80% reads, 20% writes
 		if rnd.Intn(5) == 0 {
 			return []string{"SET", key, value}

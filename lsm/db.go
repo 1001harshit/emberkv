@@ -377,13 +377,25 @@ func (db *DB) Write(b *Batch) error {
 	for i := range b.entries {
 		keys[i] = b.entries[i].Key
 	}
-	unlock := db.locks.lock(keys)
-	c, err := db.apply(b.entries)
-	unlock()
+	return db.WriteKeys(keys, b)
+}
+
+// WriteKeys is Write holding the key locks for lockKeys, with the same
+// meaning as in TxnKeys. It is the cheap path for blind writes: no
+// transaction, no reads, just the locks and one append.
+func (db *DB) WriteKeys(lockKeys [][]byte, b *Batch) error {
+	c, err := db.WriteKeysNoWait(lockKeys, b)
 	if err != nil {
 		return err
 	}
 	return c.Wait()
+}
+
+// WriteKeysNoWait is WriteKeys without waiting for durability; see
+// TxnKeysNoWait.
+func (db *DB) WriteKeysNoWait(lockKeys [][]byte, b *Batch) (Commit, error) {
+	defer db.locks.lock(lockKeys)()
+	return db.apply(b.entries)
 }
 
 // Update atomically reads key and replaces it with fn's result. fn receives

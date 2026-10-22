@@ -1,6 +1,7 @@
 package keyspace
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sync"
@@ -306,4 +307,71 @@ func TestBlindWriteDoesNotInterleaveWithReadModifyWrite(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestBlindBatchWritesRespectKeyLocks races MSET and SET against HINCRBY on
+// the same keys: the batch path must still take the key locks, so a key's
+// metadata and its fields always agree afterwards.
+func TestBlindBatchWritesRespectKeyLocks(t *testing.T) {
+	s := open(t, lsm.Options{})
+	keys := bs("a", "b", "c", "d")
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				s.MSet(bs("a", "1", "b", "2", "c", "3"))
+				s.SetEx(b("d"), b("x"), 0)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				for _, k := range keys {
+					if _, err := s.HIncrBy(k, b(fmt.Sprintf("f%d", i%3)), 1); err != nil && !errors.Is(err, ErrWrongType) {
+						t.Error(err)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	for _, k := range keys {
+		switch typ, _ := s.Type(k); typ {
+		case TypeHash:
+			n, _ := s.HLen(k)
+			var fields int64
+			s.HGetAll(k, func([]byte, []byte) { fields++ })
+			if fields != n {
+				t.Fatalf("%s: HLEN %d but %d fields", k, n, fields)
+			}
+		case TypeString:
+			if _, err := s.Get(k); err != nil {
+				t.Fatalf("%s: %v", k, err)
+			}
+		default:
+			t.Fatalf("%s has type %v", k, typ)
+		}
+	}
+}
+
+func BenchmarkMSet(bm *testing.B) {
+	s, err := Open(bm.TempDir(), lsm.Options{SyncMode: wal.SyncNever})
+	if err != nil {
+		bm.Fatal(err)
+	}
+	defer s.Close()
+	val := bytes.Repeat([]byte("v"), 64)
+	bm.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			pairs := make([][]byte, 0, 20)
+			for k := 0; k < 10; k++ {
+				pairs = append(pairs, []byte(fmt.Sprintf("key:%d", (i*10+k)%100000)), val)
+			}
+			s.MSet(pairs)
+			i++
+		}
+	})
 }

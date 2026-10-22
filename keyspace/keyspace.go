@@ -202,6 +202,20 @@ func (s *Store) Session(p *Pending) *Store {
 	return &Store{db: s.db, shared: s.shared, pending: p}
 }
 
+// write applies a batch of blind writes holding the locks for keys, waiting
+// for durability unless the Store is a Session. It skips the transaction
+// machinery, which blind writes do not need.
+func (s *Store) write(keys [][]byte, b *lsm.Batch) error {
+	if s.pending == nil {
+		return s.db.WriteKeys(keys, b)
+	}
+	c, err := s.db.WriteKeysNoWait(keys, b)
+	if err == nil {
+		s.pending.commits = append(s.pending.commits, c)
+	}
+	return err
+}
+
 // txn runs a transaction locking keys, waiting for durability unless the
 // Store is a Session.
 func (s *Store) txn(keys [][]byte, fn func(*lsm.Txn) error) error {
@@ -374,12 +388,11 @@ func (s *Store) FlushAll() error {
 	for len(keys) > 0 {
 		n := min(len(keys), 1000)
 		chunk := keys[:n]
-		if err := s.txn(chunk, func(tx *lsm.Txn) error {
-			for _, k := range chunk {
-				tx.Delete(metaKey(k))
-			}
-			return nil
-		}); err != nil {
+		b := new(lsm.Batch)
+		for _, k := range chunk {
+			b.Delete(metaKey(k))
+		}
+		if err := s.write(chunk, b); err != nil {
 			return err
 		}
 		keys = keys[n:]
@@ -444,26 +457,26 @@ func (s *Store) SetUpdate(key []byte, fn func(cur *lsm.Item, other bool) (next *
 
 // MSet sets several strings atomically, overwriting keys of any type.
 func (s *Store) MSet(pairs [][]byte) error {
-	var keys [][]byte
+	keys := make([][]byte, 0, len(pairs)/2)
+	b := new(lsm.Batch)
 	for i := 0; i+1 < len(pairs); i += 2 {
 		keys = append(keys, pairs[i])
+		b.Set(metaKey(pairs[i]), encodeString(pairs[i+1]), 0)
 	}
-	return s.txn(keys, func(tx *lsm.Txn) error {
-		for i := 0; i+1 < len(pairs); i += 2 {
-			m := meta{typ: TypeString, value: pairs[i+1]}
-			tx.Set(metaKey(pairs[i]), m.encode(), 0)
-		}
-		return nil
-	})
+	return s.write(keys, b)
 }
 
 // SetEx sets a string with an expiry (unix ms, 0 for none), overwriting any
 // type. It is a blind write, but still takes the key's lock so it cannot land
 // between another operation's read and write of the same key.
 func (s *Store) SetEx(key, value []byte, expireAt int64) error {
-	return s.txn([][]byte{key}, func(tx *lsm.Txn) error {
-		m := meta{typ: TypeString, value: value}
-		tx.Set(metaKey(key), m.encode(), expireAt)
-		return nil
-	})
+	return s.write([][]byte{key}, new(lsm.Batch).Set(metaKey(key), encodeString(value), expireAt))
+}
+
+// encodeString builds a string's metadata record in one allocation.
+func encodeString(value []byte) []byte {
+	b := make([]byte, 1+len(value))
+	b[0] = byte(TypeString)
+	copy(b[1:], value)
+	return b
 }
