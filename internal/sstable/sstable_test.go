@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/1001harshit/emberkv/internal/base"
+	"github.com/1001harshit/emberkv/internal/cache"
 )
 
 func key(i int) []byte { return []byte(fmt.Sprintf("key-%06d", i)) }
@@ -129,5 +130,36 @@ func TestBadMagicRejected(t *testing.T) {
 	os.WriteFile(path, data, 0o644)
 	if _, err := Open(path); err == nil {
 		t.Fatal("opened a table with a bad footer")
+	}
+}
+
+func TestBlockCache(t *testing.T) {
+	r, err := Open(buildTable(t, 5000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	c := cache.New(1 << 20)
+	r.SetCache(7, c)
+
+	for round := 0; round < 2; round++ {
+		for i := 0; i < 5000; i += 50 {
+			if _, ok, err := r.Get(key(i * 2)); err != nil || !ok {
+				t.Fatalf("Get(%s) = %v, %v", key(i*2), ok, err)
+			}
+		}
+	}
+	hits, misses, _ := c.Stats()
+	if misses == 0 || hits < misses {
+		t.Fatalf("second pass should hit the cache: %d hits, %d misses", hits, misses)
+	}
+
+	// Scans read through the cache but do not fill it.
+	c2 := cache.New(1 << 20)
+	r.SetCache(8, c2)
+	for it := r.Iterator(nil); it.Next(); {
+	}
+	if _, _, size := c2.Stats(); size != 0 {
+		t.Fatalf("a full scan cached %d bytes", size)
 	}
 }

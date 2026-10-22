@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/1001harshit/emberkv/internal/base"
+	"github.com/1001harshit/emberkv/internal/cache"
 	"github.com/1001harshit/emberkv/internal/memtable"
 	"github.com/1001harshit/emberkv/internal/sstable"
 	"github.com/1001harshit/emberkv/internal/wal"
@@ -48,6 +49,9 @@ type Options struct {
 	CompactionTrigger int
 	// BloomBitsPerKey sizes each table's Bloom filter. Default 10 (~1% false positives).
 	BloomBitsPerKey int
+	// BlockCacheSize is the memory, in bytes, for caching recently read
+	// SSTable blocks. Default 64 MiB; negative disables the cache.
+	BlockCacheSize int64
 	// MaxImmutable is how many frozen memtables may await flushing before
 	// writes stall. Default 4.
 	MaxImmutable int
@@ -73,6 +77,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.BloomBitsPerKey <= 0 {
 		o.BloomBitsPerKey = 10
+	}
+	if o.BlockCacheSize == 0 {
+		o.BlockCacheSize = 64 << 20
 	}
 	if o.MaxImmutable <= 0 {
 		o.MaxImmutable = 4
@@ -128,6 +135,7 @@ type DB struct {
 	closed  bool
 
 	nextFile atomic.Uint64
+	cache    *cache.Cache // nil when disabled
 
 	flushCh   chan struct{}
 	compactCh chan struct{}
@@ -158,6 +166,9 @@ func Open(dir string, opts Options) (*DB, error) {
 	}
 	db.stall = sync.NewCond(&db.mu)
 	db.locks.seed = maphash.MakeSeed()
+	if db.opts.BlockCacheSize > 0 {
+		db.cache = cache.New(db.opts.BlockCacheSize)
+	}
 	if err := db.recover(); err != nil {
 		for _, t := range db.tables {
 			t.r.Close()
@@ -193,6 +204,7 @@ func (db *DB) recover() error {
 		if err != nil {
 			return err
 		}
+		r.SetCache(id, db.cache)
 		db.tables = append(db.tables, &table{id: id, r: r})
 		live[id] = true
 	}
@@ -304,6 +316,7 @@ func (db *DB) writeTable(id uint64, it base.Iterator, bottom bool, drop func(*ba
 	if err != nil {
 		return nil, err
 	}
+	r.SetCache(id, db.cache)
 	return &table{id: id, r: r}, nil
 }
 
@@ -754,6 +767,9 @@ type Stats struct {
 	Tables        []TableInfo
 	Flushes       uint64
 	Compactions   uint64
+	CacheHits     uint64
+	CacheMisses   uint64
+	CacheBytes    int64
 }
 
 // Stats returns a snapshot of the store's internal state.
@@ -766,6 +782,9 @@ func (db *DB) Stats() Stats {
 		Immutable:     len(db.imm),
 		Flushes:       db.flushes.Load(),
 		Compactions:   db.compactions.Load(),
+	}
+	if db.cache != nil {
+		s.CacheHits, s.CacheMisses, s.CacheBytes = db.cache.Stats()
 	}
 	for _, t := range db.tables {
 		s.Tables = append(s.Tables, TableInfo{ID: t.id, Keys: t.r.Count(), Bytes: t.r.Size()})

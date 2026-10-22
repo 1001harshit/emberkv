@@ -22,6 +22,7 @@ func main() {
 	fsync := flag.String("fsync", "everysec", "WAL fsync policy: always, everysec or no")
 	memtableMB := flag.Int("memtable-mb", 4, "memtable size in MiB before it is flushed to disk")
 	trigger := flag.Int("compaction-trigger", 4, "number of SSTables before background compaction starts")
+	cacheMB := flag.Int("block-cache-mb", 64, "memory for caching SSTable blocks, in MiB (0 disables)")
 	version := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
@@ -40,6 +41,7 @@ func main() {
 		MemtableSize:      *memtableMB << 20,
 		SyncMode:          mode,
 		CompactionTrigger: *trigger,
+		BlockCacheSize:    blockCacheBytes(*cacheMB),
 		Logger:            logger,
 	})
 	if err != nil {
@@ -68,4 +70,13 @@ func main() {
 	if err := st.Close(); err != nil {
 		logger.Fatal(err)
 	}
+}
+
+// blockCacheBytes converts the -block-cache-mb flag to lsm.Options, where 0
+// means "use the default" and a negative size disables the cache.
+func blockCacheBytes(mb int) int64 {
+	if mb <= 0 {
+		return -1
+	}
+	return int64(mb) << 20
 }

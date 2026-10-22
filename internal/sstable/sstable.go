@@ -22,6 +22,7 @@ import (
 
 	"github.com/1001harshit/emberkv/internal/base"
 	"github.com/1001harshit/emberkv/internal/bloom"
+	"github.com/1001harshit/emberkv/internal/cache"
 )
 
 const (
@@ -162,6 +163,8 @@ func (w *Writer) Abort() {
 // concurrent use.
 type Reader struct {
 	f      *os.File
+	id     uint64
+	cache  *cache.Cache
 	index  []indexEntry
 	filter *bloom.Filter
 	count  uint64
@@ -269,6 +272,13 @@ func decodeIndex(b []byte) ([]indexEntry, error) {
 	return index, nil
 }
 
+// SetCache makes the reader keep recently read blocks in c, under id, which
+// must be unique per table among the readers sharing c. Call it before the
+// reader is shared.
+func (r *Reader) SetCache(id uint64, c *cache.Cache) {
+	r.id, r.cache = id, c
+}
+
 // Count returns the number of entries in the table.
 func (r *Reader) Count() uint64 { return r.count }
 
@@ -287,9 +297,25 @@ func (r *Reader) findBlock(key []byte) int {
 	return i - 1
 }
 
-// readBlock reads and verifies a data block. Each call returns a fresh buffer,
-// so decoded entries stay valid after later reads.
-func (r *Reader) readBlock(i int) ([]byte, error) {
+// readBlock returns the verified contents of data block i, from the cache
+// when possible. On a miss the block is read from the file and, if fill is
+// true, cached; scans pass false so a large scan does not evict the hot
+// blocks that point lookups depend on. Blocks are never modified after this,
+// so entries decoded from them stay valid.
+func (r *Reader) readBlock(i int, fill bool) ([]byte, error) {
+	if r.cache != nil {
+		if b, ok := r.cache.Get(r.id, i); ok {
+			return b, nil
+		}
+	}
+	b, err := r.readBlockFromFile(i)
+	if err == nil && fill && r.cache != nil {
+		r.cache.Put(r.id, i, b)
+	}
+	return b, err
+}
+
+func (r *Reader) readBlockFromFile(i int) ([]byte, error) {
 	ie := r.index[i]
 	buf := make([]byte, ie.length)
 	if _, err := r.f.ReadAt(buf, int64(ie.offset)); err != nil {
@@ -311,7 +337,7 @@ func (r *Reader) Get(key []byte) (base.Entry, bool, error) {
 	if bi < 0 {
 		return base.Entry{}, false, nil
 	}
-	block, err := r.readBlock(bi)
+	block, err := r.readBlock(bi, true)
 	if err != nil {
 		return base.Entry{}, false, err
 	}
@@ -357,7 +383,7 @@ func (it *iterator) Next() bool {
 			if it.bi >= len(it.r.index) {
 				return false
 			}
-			it.block, it.err = it.r.readBlock(it.bi)
+			it.block, it.err = it.r.readBlock(it.bi, false)
 			it.off = 0
 			continue
 		}
