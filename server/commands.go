@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/1001harshit/emberkv/internal/resp"
+	"github.com/1001harshit/emberkv/keyspace"
 	"github.com/1001harshit/emberkv/lsm"
 )
 
@@ -74,6 +75,9 @@ func init() {
 		"client":    {cmdClient, -2},
 		"config":    {cmdConfig, -2},
 	}
+	for name, cmd := range containerCommands {
+		commands[name] = cmd
+	}
 }
 
 // replyErr is an error whose text is sent to the client verbatim.
@@ -87,14 +91,22 @@ const (
 	errOverflow   = replyErr("ERR increment or decrement would overflow")
 )
 
-func (c *ctx) db() *lsm.DB  { return c.s.db }
-func (c *ctx) nowMs() int64 { return c.s.db.Now().UnixMilli() }
+func (c *ctx) st() *keyspace.Store { return c.s.st }
+func (c *ctx) db() *lsm.DB         { return c.s.st.DB() }
+func (c *ctx) nowMs() int64        { return c.db().Now().UnixMilli() }
 
 func (c *ctx) fail(err error) {
 	var re replyErr
 	if errors.As(err, &re) {
 		c.w.WriteError(string(re))
 		return
+	}
+	// These keyspace errors already carry their Redis error code.
+	for _, e := range []error{keyspace.ErrWrongType, keyspace.ErrNotInteger, keyspace.ErrOverflow} {
+		if errors.Is(err, e) {
+			c.w.WriteError(e.Error())
+			return
+		}
 	}
 	c.w.WriteError("ERR " + err.Error())
 }
@@ -117,16 +129,10 @@ func parseInt(b []byte) (int64, error) {
 	return n, nil
 }
 
-// get returns the item for key, or nil if it does not exist.
+// get returns the string at key, or nil if it does not exist. It fails with
+// keyspace.ErrWrongType if the key holds another type.
 func (c *ctx) get(key []byte) (*lsm.Item, error) {
-	item, err := c.db().GetItem(key)
-	if errors.Is(err, lsm.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &item, nil
+	return c.st().Get(key)
 }
 
 // ---- connection ----
@@ -232,12 +238,26 @@ func cmdSet(c *ctx) {
 		c.fail(errSyntax)
 		return
 	}
+	if !nx && !xx && !get && !keepTTL {
+		// A plain SET overwrites any type, so it needs no read: a blind write.
+		if err := c.st().SetEx(key, val, exp); err != nil {
+			c.fail(err)
+			return
+		}
+		c.ok()
+		return
+	}
 
 	var old *lsm.Item
 	wrote := false
-	err := c.db().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().SetUpdate(key, func(cur *lsm.Item, other bool) (*lsm.Item, bool, error) {
+		// SET overwrites a key of any type, but SET ... GET needs a string.
+		if other && get {
+			return nil, false, keyspace.ErrWrongType
+		}
 		old = cur
-		if (nx && cur != nil) || (xx && cur == nil) {
+		exists := cur != nil || other
+		if (nx && exists) || (xx && !exists) {
 			return nil, false, nil
 		}
 		next := &lsm.Item{Value: val, ExpireAt: exp}
@@ -261,7 +281,7 @@ func cmdSet(c *ctx) {
 
 func cmdSetNX(c *ctx) {
 	var wrote int64
-	err := c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		if cur != nil {
 			return nil, false, nil
 		}
@@ -287,7 +307,7 @@ func cmdSetEx(unit time.Duration) func(*ctx) {
 			c.w.WriteError("ERR invalid expire time in '" + strings.ToLower(string(c.args[0])) + "' command")
 			return
 		}
-		if err := c.db().Write(new(lsm.Batch).Set(c.args[1], c.args[3], exp)); err != nil {
+		if err := c.st().SetEx(c.args[1], c.args[3], exp); err != nil {
 			c.fail(err)
 			return
 		}
@@ -297,7 +317,7 @@ func cmdSetEx(unit time.Duration) func(*ctx) {
 
 func cmdGetSet(c *ctx) {
 	var old *lsm.Item
-	err := c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		old = cur
 		return &lsm.Item{Value: c.args[2]}, true, nil
 	})
@@ -310,7 +330,7 @@ func cmdGetSet(c *ctx) {
 
 func cmdGetDel(c *ctx) {
 	var old *lsm.Item
-	err := c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		old = cur
 		return nil, cur != nil, nil
 	})
@@ -324,16 +344,13 @@ func cmdGetDel(c *ctx) {
 func cmdDel(c *ctx) {
 	var n int64
 	for _, key := range c.args[1:] {
-		err := c.db().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
-			if cur == nil {
-				return nil, false, nil
-			}
-			n++
-			return nil, true, nil
-		})
+		existed, err := c.st().Delete(key)
 		if err != nil {
 			c.fail(err)
 			return
+		}
+		if existed {
+			n++
 		}
 	}
 	c.w.WriteInt(n)
@@ -342,12 +359,12 @@ func cmdDel(c *ctx) {
 func cmdExists(c *ctx) {
 	var n int64
 	for _, key := range c.args[1:] {
-		item, err := c.get(key)
+		ok, err := c.st().Exists(key)
 		if err != nil {
 			c.fail(err)
 			return
 		}
-		if item != nil {
+		if ok {
 			n++
 		}
 	}
@@ -356,7 +373,7 @@ func cmdExists(c *ctx) {
 
 func (c *ctx) incrBy(key []byte, delta int64) {
 	var result int64
-	err := c.db().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		var n, exp int64
 		if cur != nil {
 			v, err := parseInt(cur.Value)
@@ -402,7 +419,7 @@ func cmdIncrBy(sign int64) func(*ctx) {
 
 func cmdAppend(c *ctx) {
 	var length int
-	err := c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		next := &lsm.Item{}
 		if cur != nil {
 			next.Value = append(append([]byte{}, cur.Value...), c.args[2]...)
@@ -437,6 +454,9 @@ func cmdMGet(c *ctx) {
 	items := make([]*lsm.Item, 0, len(c.args)-1)
 	for _, key := range c.args[1:] {
 		item, err := c.get(key)
+		if errors.Is(err, keyspace.ErrWrongType) {
+			item, err = nil, nil // MGET reports non-strings as nil
+		}
 		if err != nil {
 			c.fail(err)
 			return
@@ -454,11 +474,7 @@ func cmdMSet(c *ctx) {
 		c.w.WriteError("ERR wrong number of arguments for 'mset' command")
 		return
 	}
-	b := new(lsm.Batch)
-	for i := 1; i < len(c.args); i += 2 {
-		b.Set(c.args[i], c.args[i+1], 0)
-	}
-	if err := c.db().Write(b); err != nil {
+	if err := c.st().MSet(c.args[1:]); err != nil {
 		c.fail(err)
 		return
 	}
@@ -480,37 +496,30 @@ func cmdExpire(unit time.Duration, absolute bool) func(*ctx) {
 			c.w.WriteError("ERR invalid expire time in '" + strings.ToLower(string(c.args[0])) + "' command")
 			return
 		}
-		var res int64
-		err = c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
-			if cur == nil {
-				return nil, false, nil
-			}
-			res = 1
-			if exp <= now {
-				return nil, true, nil // a deadline in the past deletes the key
-			}
-			return &lsm.Item{Value: cur.Value, ExpireAt: exp}, true, nil
+		// UpdateExpiry deletes the key when the deadline is not in the future.
+		existed, err := c.st().UpdateExpiry(c.args[1], func(int64) (int64, bool) {
+			return max(exp, 1), true
 		})
 		if err != nil {
 			c.fail(err)
 			return
 		}
-		c.w.WriteInt(res)
+		c.w.WriteInt(boolInt(existed))
 	}
 }
 
 func cmdTTL(unit time.Duration) func(*ctx) {
 	return func(c *ctx) {
-		item, err := c.get(c.args[1])
+		expireAt, exists, err := c.st().ExpireAt(c.args[1])
 		switch {
 		case err != nil:
 			c.fail(err)
-		case item == nil:
+		case !exists:
 			c.w.WriteInt(-2)
-		case item.ExpireAt == 0:
+		case expireAt == 0:
 			c.w.WriteInt(-1)
 		default:
-			ms := max(item.ExpireAt-c.nowMs(), 0)
+			ms := max(expireAt-c.nowMs(), 0)
 			if unit == time.Second {
 				c.w.WriteInt((ms + 500) / 1000)
 			} else {
@@ -521,39 +530,40 @@ func cmdTTL(unit time.Duration) func(*ctx) {
 }
 
 func cmdPersist(c *ctx) {
-	var res int64
-	err := c.db().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
-		if cur == nil || cur.ExpireAt == 0 {
-			return nil, false, nil
-		}
-		res = 1
-		return &lsm.Item{Value: cur.Value}, true, nil
+	changed := false
+	_, err := c.st().UpdateExpiry(c.args[1], func(expireAt int64) (int64, bool) {
+		changed = expireAt != 0
+		return 0, changed
 	})
 	if err != nil {
 		c.fail(err)
 		return
 	}
-	c.w.WriteInt(res)
+	c.w.WriteInt(boolInt(changed))
+}
+
+func boolInt(b bool) int64 {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // ---- keyspace ----
 
 func cmdType(c *ctx) {
-	item, err := c.get(c.args[1])
-	switch {
-	case err != nil:
+	t, err := c.st().Type(c.args[1])
+	if err != nil {
 		c.fail(err)
-	case item == nil:
-		c.w.WriteSimple("none")
-	default:
-		c.w.WriteSimple("string")
+		return
 	}
+	c.w.WriteSimple(t.String())
 }
 
 func cmdKeys(c *ctx) {
 	pattern := c.args[1]
 	var keys [][]byte
-	err := c.db().Scan(nil, func(key []byte, _ lsm.Item) bool {
+	err := c.st().Scan(nil, func(key []byte, _ keyspace.Type) bool {
 		if globMatch(pattern, key) {
 			keys = append(keys, key)
 		}
@@ -587,7 +597,7 @@ func cmdScan(c *ctx) {
 
 	count := 10
 	var match []byte
-	onlyStrings := true
+	var typeFilter string
 	for i := 2; i < len(c.args); i += 2 {
 		if i+1 >= len(c.args) {
 			c.fail(errSyntax)
@@ -608,7 +618,7 @@ func cmdScan(c *ctx) {
 			}
 			count = int(min(n, 1<<20))
 		case "TYPE":
-			onlyStrings = strings.EqualFold(string(c.args[i+1]), "string")
+			typeFilter = strings.ToLower(string(c.args[i+1]))
 		default:
 			c.fail(errSyntax)
 			return
@@ -620,13 +630,13 @@ func cmdScan(c *ctx) {
 	var next []byte
 	var page [][]byte
 	examined := 0
-	err = c.db().Scan(start, func(key []byte, _ lsm.Item) bool {
+	err = c.st().Scan(start, func(key []byte, t keyspace.Type) bool {
 		if examined == count {
 			next = key
 			return false
 		}
 		examined++
-		if onlyStrings && (match == nil || globMatch(match, key)) {
+		if (typeFilter == "" || typeFilter == t.String()) && (match == nil || globMatch(match, key)) {
 			page = append(page, key)
 		}
 		return true
@@ -648,7 +658,7 @@ func cmdScan(c *ctx) {
 }
 
 func cmdDBSize(c *ctx) {
-	n, err := c.db().Count()
+	n, err := c.st().Count()
 	if err != nil {
 		c.fail(err)
 		return
@@ -661,25 +671,9 @@ func cmdFlushDB(c *ctx) {
 		c.fail(errSyntax)
 		return
 	}
-	var keys [][]byte
-	if err := c.db().Scan(nil, func(key []byte, _ lsm.Item) bool {
-		keys = append(keys, key)
-		return true
-	}); err != nil {
+	if err := c.st().FlushAll(); err != nil {
 		c.fail(err)
 		return
-	}
-	for len(keys) > 0 {
-		n := min(len(keys), 1000)
-		b := new(lsm.Batch)
-		for _, k := range keys[:n] {
-			b.Delete(k)
-		}
-		if err := c.db().Write(b); err != nil {
-			c.fail(err)
-			return
-		}
-		keys = keys[n:]
 	}
 	c.ok()
 }
@@ -785,7 +779,7 @@ func cmdInfo(c *ctx) {
 		line("")
 	}
 	if want("keyspace") {
-		n, err := c.db().Count()
+		n, err := c.st().Count()
 		if err != nil {
 			c.fail(err)
 			return

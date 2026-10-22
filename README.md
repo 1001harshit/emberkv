@@ -18,6 +18,10 @@ $ redis-cli -p 6380
 OK
 127.0.0.1:6380> INCR visits
 (integer) 1
+127.0.0.1:6380> HSET user:2 name "grace" lang "cobol"
+(integer) 2
+127.0.0.1:6380> SADD tags go db
+(integer) 2
 127.0.0.1:6380> SCAN 0 MATCH user:* COUNT 100
 1) "0"
 2) 1) "user:1"
@@ -29,9 +33,10 @@ OK
 - **Durable writes with group commit.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Concurrent writers share one `write` and one `fsync`. Torn writes from a crash are detected and discarded on recovery.
 - **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives).
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
+- **Strings, hashes and sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field or member. Deleting or expiring a hash of any size is a single write, and a compaction filter later reclaims the orphaned fields.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
-- **Atomic batches and read-modify-write.** `MSET` is all-or-nothing even across a crash. `INCR`, `SET NX`, `APPEND` and the rest are atomic.
-- **Embeddable.** The `lsm` package is a standalone Go key-value store you can use without the server.
+- **Atomic multi-key transactions.** `MSET` is all-or-nothing even across a crash. `INCR`, `SET NX`, `HSET`, `HINCRBY`, `SADD` and the rest are atomic.
+- **Embeddable.** The `lsm` package is a standalone Go key-value store, and `keyspace` adds Redis types on top. Neither needs the server.
 
 ## Quick start
 
@@ -116,6 +121,16 @@ db.Scan([]byte("user:"), func(k []byte, it lsm.Item) bool {
 
 Tombstones and expired entries can only be dropped when the run includes the oldest table. Before that, they still have to hide older versions further down. `COMPACT` (an emberkv extension) forces a full merge.
 
+**Data types (`keyspace/`).** Redis types are mapped onto the flat LSM keyspace the way [Apache Kvrocks](https://kvrocks.apache.org/community/data-structure-on-rocksdb) does it:
+
+```
+'m' | key                                → type | string value          (TTL on this record)
+'m' | key                                → type | version | size        (hash / set metadata)
+'f' | len(key) | key | version | field   → field value ("" for set members)
+```
+
+Every operation first reads the key's metadata to get its type and current *version*, then reads or writes the member records under that version. All of it runs inside an `lsm.Txn`, so it is applied as one atomic WAL batch. Deleting, overwriting or expiring a hash with a million fields is therefore one metadata write: the old fields keep a version that is never read again. A [compaction filter](keyspace/keyspace.go) hook in the engine drops those orphaned records when compaction rewrites them. Versions come from a monotonic clock and are never reused, so a record that is stale once stays stale forever, which is what makes dropping it safe even in a non-bottom compaction. HGETALL, SMEMBERS and HKEYS are prefix scans over `'f' | key | version`. A plain `SET` is a blind write, with no read first, because it overwrites any type.
+
 **Crash recovery.** On startup, files missing from the `MANIFEST` are removed as leftovers of an interrupted flush or compaction. Every WAL is replayed oldest first, stopping at the first torn or corrupt record. The result is flushed to a table before new writes are accepted.
 
 ### On-disk format
@@ -134,11 +149,13 @@ entry          kind(1) | expire_at_ms(uvarint) | key_len(uvarint) | key | val_le
 | Strings | `GET` `SET [NX\|XX] [GET] [EX\|PX\|EXAT\|PXAT\|KEEPTTL]` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `MGET` `MSET` `APPEND` `STRLEN` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN [MATCH] [COUNT] [TYPE]` `DBSIZE` `FLUSHDB` `FLUSHALL` |
+| Hashes | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HGETALL` `HKEYS` `HVALS` `HDEL` `HLEN` `HEXISTS` `HSTRLEN` `HINCRBY` |
+| Sets | `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SINTER` `SUNION` `SDIFF` |
 | Expiry | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
 | Server | `PING` `ECHO` `SELECT 0` `INFO [section]` `TIME` `QUIT` `COMMAND` `CLIENT` `CONFIG GET` |
 | emberkv | `COMPACT`: flush and fully compact, reclaiming space |
 
-Only the string type is supported. Lists, hashes, sets and the rest are on the roadmap.
+Strings, hashes and sets are supported, with Redis's `WRONGTYPE` errors. Lists and sorted sets are on the roadmap.
 
 ## Testing
 
@@ -149,6 +166,7 @@ go test -race ./...
 - **Model-based test**: 30,000 random puts, deletes, batches and reads, with reopens along the way, checked against a plain Go map. It uses a 4 KiB memtable so that flushes and compactions happen constantly.
 - **Crash test**: copies the data directory while the database is still running (what the disk looks like after a power cut) and checks that the copy recovers every acknowledged write. I also checked by hand that `kill -9` in the middle of a write stream loses nothing with `-fsync always`.
 - **Corruption tests**: torn WAL tails, flipped bits in WAL records and SSTable blocks, and bad footers.
+- **Keyspace tests**: hash and set semantics, `WRONGTYPE` rules, and that recreating a deleted hash never shows its old fields. They also check that compaction physically removes the fields of deleted, overwritten and expired hashes (an exact on-disk record count), and that concurrent `HINCRBY`/`SADD` never lose updates.
 - **Server integration tests**: drive every command over real TCP, including pipelining, inline commands, protocol errors, `SCAN` completeness and concurrent clients.
 
 ## Benchmarks
@@ -157,10 +175,13 @@ go test -race ./...
 
 | Test (`-fsync everysec`) | Pipeline 1 | Pipeline 16 |
 |---|---|---|
-| `SET` | ~100k ops/s (p50 0.41 ms) | ~125k ops/s |
+| `SET` | ~120k ops/s (p50 0.36 ms) | ~125k ops/s |
 | `GET` | ~141k ops/s (p50 0.33 ms) | ~695k ops/s |
 | `INCR` | ~105k ops/s | |
-| 80/20 read/write | ~118k ops/s | |
+| `HSET` | ~75k ops/s | |
+| `HGET` | ~136k ops/s | |
+| `SADD` | ~80k ops/s | |
+| 80/20 read/write | ~130k ops/s | |
 
 Effect of group commit on writes (pipeline 1):
 
@@ -173,7 +194,8 @@ Effect of group commit on writes (pipeline 1):
 
 - [x] Group commit: batch concurrent writers into one WAL write and fsync
 - [ ] Block cache for hot SSTable blocks
-- [ ] Hashes, lists and sets, encoded as composite keys over the same LSM
+- [x] Hashes and sets, encoded as composite keys over the same LSM (Kvrocks-style)
+- [ ] Lists and sorted sets
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
 - [ ] Key-prefix compression inside blocks
 - [ ] Replication via WAL shipping

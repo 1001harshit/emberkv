@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/1001harshit/emberkv/internal/wal"
+	"github.com/1001harshit/emberkv/keyspace"
 	"github.com/1001harshit/emberkv/lsm"
 	"github.com/1001harshit/emberkv/server"
 )
@@ -35,7 +36,7 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	db, err := lsm.Open(*dir, lsm.Options{
+	st, err := keyspace.Open(*dir, lsm.Options{
 		MemtableSize:      *memtableMB << 20,
 		SyncMode:          mode,
 		CompactionTrigger: *trigger,
@@ -47,10 +48,10 @@ func main() {
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
-		db.Close()
+		st.Close()
 		logger.Fatal(err)
 	}
-	srv := server.New(db, logger)
+	srv := server.New(st, logger)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -64,7 +65,7 @@ func main() {
 	if err := srv.Serve(ln); err != nil {
 		logger.Print(err)
 	}
-	if err := db.Close(); err != nil {
+	if err := st.Close(); err != nil {
 		logger.Fatal(err)
 	}
 }

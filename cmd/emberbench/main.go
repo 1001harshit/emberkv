@@ -25,7 +25,7 @@ func main() {
 	pipeline := flag.Int("P", 1, "commands pipelined per round trip")
 	size := flag.Int("d", 64, "value size in bytes")
 	keyspace := flag.Int("r", 100000, "number of distinct keys")
-	tests := flag.String("t", "set,get", "comma-separated tests: set, get, incr, mixed")
+	tests := flag.String("t", "set,get", "comma-separated tests: set, get, incr, hset, hget, sadd, mixed")
 	flag.Parse()
 
 	value := strings.Repeat("x", *size)
@@ -46,6 +46,15 @@ func command(test string, rnd *rand.Rand, keyspace int, value string) []string {
 		return []string{"GET", key}
 	case "incr":
 		return []string{"INCR", "counter:" + strconv.Itoa(rnd.Intn(keyspace))}
+	case "hset": // fields spread over 1000 hashes
+		n := rnd.Intn(keyspace)
+		return []string{"HSET", "hash:" + strconv.Itoa(n%1000), "field:" + strconv.Itoa(n), value}
+	case "hget":
+		n := rnd.Intn(keyspace)
+		return []string{"HGET", "hash:" + strconv.Itoa(n%1000), "field:" + strconv.Itoa(n)}
+	case "sadd":
+		n := rnd.Intn(keyspace)
+		return []string{"SADD", "set:" + strconv.Itoa(n%1000), "member:" + strconv.Itoa(n)}
 	case "mixed": // 80% reads, 20% writes
 		if rnd.Intn(5) == 0 {
 			return []string{"SET", key, value}

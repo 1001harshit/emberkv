@@ -11,7 +11,7 @@ run: build
 
 # Load-test a server started with `make run`.
 bench: build
-	./bin/emberbench -t set,get,incr,mixed
+	./bin/emberbench -t set,get,incr,hset,hget,sadd,mixed
 	./bin/emberbench -t set,get -P 16 -n 1000000
 
 lint:

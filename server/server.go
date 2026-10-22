@@ -1,5 +1,5 @@
-// Package server exposes an lsm.DB over TCP using the Redis protocol, so
-// redis-cli and ordinary Redis client libraries can talk to it.
+// Package server exposes a keyspace.Store over TCP using the Redis protocol,
+// so redis-cli and ordinary Redis client libraries can talk to it.
 package server
 
 import (
@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/1001harshit/emberkv/internal/resp"
-	"github.com/1001harshit/emberkv/lsm"
+	"github.com/1001harshit/emberkv/keyspace"
 )
 
 // Version is reported by INFO.
@@ -21,7 +21,7 @@ const Version = "0.1.0"
 
 // Server serves Redis-protocol clients from one database.
 type Server struct {
-	db      *lsm.DB
+	st      *keyspace.Store
 	logger  *log.Logger
 	started time.Time
 	cursors *cursorTable
@@ -36,13 +36,13 @@ type Server struct {
 	totalCmds  atomic.Uint64
 }
 
-// New returns a server for db. logger may be nil.
-func New(db *lsm.DB, logger *log.Logger) *Server {
+// New returns a server for st. logger may be nil.
+func New(st *keyspace.Store, logger *log.Logger) *Server {
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
 	return &Server{
-		db:      db,
+		st:      st,
 		logger:  logger,
 		started: time.Now(),
 		cursors: newCursorTable(4096),

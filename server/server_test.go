@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/1001harshit/emberkv/internal/resp"
+	"github.com/1001harshit/emberkv/keyspace"
 	"github.com/1001harshit/emberkv/lsm"
 )
 
@@ -23,7 +24,7 @@ type client struct {
 
 func startServer(t *testing.T, opts lsm.Options) (*Server, string) {
 	t.Helper()
-	db, err := lsm.Open(t.TempDir(), opts)
+	st, err := keyspace.Open(t.TempDir(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,11 +32,11 @@ func startServer(t *testing.T, opts lsm.Options) (*Server, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := New(db, nil)
+	s := New(st, nil)
 	go s.Serve(ln)
 	t.Cleanup(func() {
 		s.Close()
-		db.Close()
+		st.Close()
 	})
 	return s, ln.Addr().String()
 }
@@ -351,4 +352,92 @@ func TestInfoAndCompact(t *testing.T) {
 	}
 	c.expect(list(), "COMMAND", "DOCS")
 	c.expect("OK", "CLIENT", "SETNAME", "test")
+}
+
+func TestHashCommands(t *testing.T) {
+	c := newClient(t)
+	c.expect(int64(2), "HSET", "user:1", "name", "ada", "lang", "go")
+	c.expect(int64(0), "HSET", "user:1", "name", "Ada")
+	c.expect("Ada", "HGET", "user:1", "name")
+	c.expect(nil, "HGET", "user:1", "nope")
+	c.expect(nil, "HGET", "missing", "name")
+	c.expect(list("Ada", nil, "go"), "HMGET", "user:1", "name", "x", "lang")
+	c.expect(list("lang", "go", "name", "Ada"), "HGETALL", "user:1")
+	c.expect(list("lang", "name"), "HKEYS", "user:1")
+	c.expect(list("go", "Ada"), "HVALS", "user:1")
+	c.expect(int64(2), "HLEN", "user:1")
+	c.expect(int64(1), "HEXISTS", "user:1", "lang")
+	c.expect(int64(0), "HEXISTS", "user:1", "zzz")
+	c.expect(int64(3), "HSTRLEN", "user:1", "name")
+	c.expect(int64(0), "HSETNX", "user:1", "name", "x")
+	c.expect(int64(1), "HSETNX", "user:1", "age", "36")
+	c.expect(int64(37), "HINCRBY", "user:1", "age", "1")
+	c.expect(int64(5), "HINCRBY", "user:1", "visits", "5")
+	c.expectErr("ERR hash value is not an integer", "HINCRBY", "user:1", "name", "1")
+	c.expect("OK", "HMSET", "user:1", "a", "1", "b", "2")
+	c.expectErr("ERR wrong number of arguments", "HSET", "user:1", "a")
+	c.expect(int64(2), "HDEL", "user:1", "a", "b", "nope")
+	c.expect("hash", "TYPE", "user:1")
+	c.expect(list(), "HGETALL", "missing")
+	c.expect(int64(0), "HLEN", "missing")
+}
+
+func TestSetCommands(t *testing.T) {
+	c := newClient(t)
+	c.expect(int64(3), "SADD", "s1", "a", "b", "c")
+	c.expect(int64(1), "SADD", "s1", "a", "d")
+	c.expect(list("a", "b", "c", "d"), "SMEMBERS", "s1")
+	c.expect(int64(1), "SISMEMBER", "s1", "a")
+	c.expect(int64(0), "SISMEMBER", "s1", "z")
+	c.expect(list(int64(1), int64(0)), "SMISMEMBER", "s1", "b", "z")
+	c.expect(int64(4), "SCARD", "s1")
+	c.do("SADD", "s2", "c", "d", "e")
+	c.expect(list("c", "d"), "SINTER", "s1", "s2")
+	c.expect(list("a", "b", "c", "d", "e"), "SUNION", "s1", "s2")
+	c.expect(list("a", "b"), "SDIFF", "s1", "s2")
+	c.expect(list(), "SINTER", "s1", "missing")
+	c.expect(int64(2), "SREM", "s1", "a", "b", "zz")
+	c.expect("set", "TYPE", "s1")
+	c.expect(int64(2), "SREM", "s1", "c", "d")
+	c.expect(int64(0), "EXISTS", "s1") // emptied sets disappear
+}
+
+func TestTypesAcrossGenericCommands(t *testing.T) {
+	c := newClient(t)
+	c.do("SET", "str", "v")
+	c.do("HSET", "hash", "f", "v")
+	c.do("SADD", "set", "m")
+
+	for _, cmd := range [][]string{
+		{"GET", "hash"}, {"INCR", "set"}, {"APPEND", "hash", "x"}, {"HGET", "str", "f"},
+		{"SADD", "hash", "m"}, {"HSET", "set", "f", "v"}, {"SMEMBERS", "str"}, {"SET", "hash", "v", "GET"},
+	} {
+		c.expectErr("WRONGTYPE", cmd...)
+	}
+	c.expect(list("v", nil, nil), "MGET", "str", "hash", "set")
+
+	c.expect(int64(3), "EXISTS", "str", "hash", "set")
+	c.expect(int64(3), "DBSIZE")
+	c.expect(list("hash", "set", "str"), "KEYS", "*")
+	reply := c.do("SCAN", "0", "TYPE", "hash").([]any)
+	if !reflect.DeepEqual(reply[1], list("hash")) {
+		t.Fatalf("SCAN TYPE hash = %v", reply[1])
+	}
+
+	// EXPIRE, TTL and PERSIST work on every type.
+	c.expect(int64(1), "EXPIRE", "hash", "100")
+	c.expect(int64(100), "TTL", "hash")
+	c.expect(int64(1), "PERSIST", "hash")
+	c.expect(int64(-1), "TTL", "hash")
+	c.expect("v", "HGET", "hash", "f")
+
+	// SET overwrites any type; DEL removes any type.
+	c.expect("OK", "SET", "set", "now-a-string")
+	c.expect("string", "TYPE", "set")
+	c.expect(int64(1), "DEL", "hash")
+	c.expect("none", "TYPE", "hash")
+	c.expect(int64(0), "HLEN", "hash")
+
+	c.expect("OK", "FLUSHDB")
+	c.expect(int64(0), "DBSIZE")
 }
