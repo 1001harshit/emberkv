@@ -205,14 +205,14 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 
 | | emberkv | Redis (AOF everysec) | Kvrocks | Dragonfly |
 |---|---|---|---|---|
-| `SET` req/s, pipeline 1 | 54k | 82k | 31k | 41k |
-| `GET` req/s, pipeline 1 | 55k | 79k | 44k | 41k |
-| `SET` req/s, pipeline 16 | 221k | 447k | 60k | 436k |
-| `GET` req/s, pipeline 16 | 568k | 911k | 328k | 473k |
-| Memory for 632k keys | **46 MiB** | 144 MiB | 168 MiB | 96 MiB |
+| `SET` req/s, pipeline 1 | 53k | 78k | 30k | 40k |
+| `GET` req/s, pipeline 1 | 55k | 74k | 44k | 40k |
+| `SET` req/s, pipeline 16 | 237k | 452k | 60k | 435k |
+| `GET` req/s, pipeline 16 | 597k | 907k | 319k | 471k |
+| Memory for 632k keys | **50 MiB** | 147 MiB | 254 MiB | 140 MiB |
 | Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
 
-Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis. Per-key locks, a block cache and one durability wait per pipeline raised pipelined throughput by up to **+180%** (see [before/after](BENCHMARKS.md#speed-fixes-before-vs-after)).
+Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, and uses about 3× less memory than Redis. Per-key locks, a block cache and one durability wait per pipeline raised pipelined throughput by up to **+235%** (see [before/after](BENCHMARKS.md#speed-fixes-before-vs-after)).
 
 ### On an Apple M2 Pro
 
@@ -241,7 +241,8 @@ Effect of group commit on writes (pipeline 1):
 - [x] Block cache for hot SSTable blocks
 - [x] Striped per-key locks so pipelined `INCR`/`HSET`/`SADD` don't serialize on one write lock
 - [ ] Lock-free skip-list memtable (the next write bottleneck)
-- [ ] Lock-only batch path for `MSET` (regressed 9–15% with per-key locks)
+- [x] Lock-only batch path for blind writes (`MSET`, `SET`, `FLUSHALL`)
+- [ ] Find the remaining ~10% `MSET` gap at pipeline 1 with `fsync everysec`
 - [x] Hashes and sets, encoded as composite keys over the same LSM (Kvrocks-style)
 - [ ] Lists and sorted sets
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
