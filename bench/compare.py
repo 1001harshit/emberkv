@@ -138,20 +138,27 @@ class Docker:
         return du_bytes(mp, sudo=True)
 
 
-def make_servers(emberkv, work):
+def make_servers(emberkv, work, baseline=None):
     def d(name):
         return os.path.join(work, name, "data")
 
-    def ember(name, port, fsync):
-        return Native(f"emberkv (fsync {fsync})", port,
-                      [emberkv, "-addr", f"127.0.0.1:{port}", "-dir", d(name), "-fsync", fsync], d(name), True)
+    def ember(name, port, fsync, binary=emberkv, label="emberkv"):
+        return Native(f"{label} (fsync {fsync})", port,
+                      [binary, "-addr", f"127.0.0.1:{port}", "-dir", d(name), "-fsync", fsync], d(name), True)
+
+    before = {}
+    if baseline:
+        before = {
+            "ember-old-es": ember("ember-old-es", 7008, "everysec", baseline, "emberkv before"),
+            "ember-old-always": ember("ember-old-always", 7009, "always", baseline, "emberkv before"),
+        }
 
     def redis_server(label, port, name, extra):
         return Native(label, port,
                       ["redis-server", "--port", str(port), "--bind", "127.0.0.1", "--dir", d(name)] + extra,
                       d(name), True)
 
-    return {
+    return before | {
         "ember-es": ember("ember-es", 7001, "everysec"),
         "ember-always": ember("ember-always", 7002, "always"),
         "redis-rdb": redis_server("Redis (default: RDB snapshots)", 7003, "redis-rdb",
@@ -357,6 +364,20 @@ def report(res):
     w("All servers ran on the same machine as the load generator (`redis-benchmark`, 50 clients, "
       "64-byte values, 100k random keys).\n")
 
+    if "ember-old-es" in res["throughput"]["1"]:
+        w(f"## emberkv before vs after (same machine, same run)\n\nBaseline: `{res['baseline']}`.\n")
+        names = ["SET", "GET", "INCR", "HSET", "SADD", "MSET"]
+        w("| fsync | pipeline | " + " | ".join(names) + " |\n|---|---|" + "---|" * len(names))
+        for fsync, old, new in (("everysec", "ember-old-es", "ember-es"), ("always", "ember-old-always", "ember-always")):
+            for p in ("1", "16"):
+                cells = []
+                for n in names:
+                    a, b = res["throughput"][p][old].get(n), res["throughput"][p][new].get(n)
+                    cells.append(f"{a['rps']:,.0f} → {b['rps']:,.0f} ({(b['rps'] / a['rps'] - 1) * 100:+.0f}%)"
+                                 if a and b else "-")
+                w(f"| {fsync} | {p} | " + " | ".join(cells) + " |")
+        w("")
+
     c = res["compat"]
     w(f"## Compatibility with Redis\n\n**{c['same']} of {c['total']}** commands returned exactly the same "
       "reply as Redis.\n")
@@ -408,11 +429,14 @@ def main():
     ap.add_argument("--emberkv", required=True)
     ap.add_argument("--out", default="results")
     ap.add_argument("--work", default="/tmp/emberkv-bench")
+    ap.add_argument("--baseline", help="an older emberkv binary to benchmark alongside")
+    ap.add_argument("--baseline-name", default="baseline", help="label for the baseline in the report")
     args = ap.parse_args()
 
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.out, exist_ok=True)
-    servers = make_servers(os.path.abspath(args.emberkv), args.work)
+    servers = make_servers(os.path.abspath(args.emberkv), args.work,
+                           os.path.abspath(args.baseline) if args.baseline else None)
 
     def version(cmd):
         return subprocess.run(cmd, capture_output=True, text=True).stdout.strip().split("\n")[0]
@@ -424,6 +448,7 @@ def main():
             version(["redis-server", "--version"]).split(" sha=")[0],
             "kvrocks:latest, dragonfly:latest (Docker)"]),
         "labels": {k: s.name for k, s in servers.items()},
+        "baseline": args.baseline_name,
     }
     try:
         print("== starting servers", flush=True)

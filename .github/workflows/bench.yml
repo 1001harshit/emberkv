@@ -5,6 +5,11 @@ name: Benchmark
 # Actions tab; the report appears in the run summary and as an artifact.
 on:
   workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Optional git ref of an older emberkv to benchmark alongside (e.g. v0.1.0)"
+        required: false
+        default: ""
 
 jobs:
   compare:
@@ -12,6 +17,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # so an older baseline ref can be built
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -20,6 +27,13 @@ jobs:
           python-version: "3.12"
       - name: Build emberkv
         run: go build -o bin/ ./cmd/...
+      - name: Build baseline
+        if: inputs.baseline != ''
+        env:
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          git worktree add /tmp/baseline "$BASELINE"
+          (cd /tmp/baseline && go build -o "$GITHUB_WORKSPACE/bin-baseline/" ./cmd/emberkv)
       - name: Install Redis, its tools and the Python client
         run: |
           sudo apt-get update -q
@@ -32,7 +46,14 @@ jobs:
           docker pull -q apache/kvrocks:latest
           docker pull -q docker.dragonflydb.io/dragonflydb/dragonfly:latest
       - name: Compare
-        run: python bench/compare.py --emberkv bin/emberkv --out results
+        env:
+          BASELINE: ${{ inputs.baseline }}
+        run: |
+          args=(--emberkv bin/emberkv --out results)
+          if [ -n "$BASELINE" ]; then
+            args+=(--baseline bin-baseline/emberkv --baseline-name "$BASELINE ($(git rev-parse --short "$BASELINE"))")
+          fi
+          python bench/compare.py "${args[@]}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
