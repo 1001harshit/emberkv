@@ -18,6 +18,7 @@ import (
 type ctx struct {
 	s    *Server
 	st   *keyspace.Store // this connection's session, or a view of the past
+	conn *connState
 	w    *resp.Writer
 	args [][]byte
 	quit bool
@@ -78,6 +79,7 @@ func init() {
 		"asof":      {cmdAsOf, -3},
 		"history":   {cmdHistory, -2},
 		"rollback":  {cmdRollback, 2},
+		"branch":    {cmdBranch, -2},
 		"info":      {cmdInfo, -1},
 		"time":      {cmdTime, 1},
 		"command":   {cmdCommand, -1},
@@ -763,6 +765,9 @@ func cmdInfo(c *ctx) {
 		line("os:%s %s", runtime.GOOS, runtime.GOARCH)
 		line("process_id:%d", os.Getpid())
 		line("uptime_in_seconds:%d", int(time.Since(c.s.started).Seconds()))
+		if c.s.branches != nil {
+			line("branches:%d", len(c.s.branches.Names()))
+		}
 		line("")
 	}
 	if want("clients") {

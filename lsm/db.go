@@ -108,7 +108,43 @@ type Item struct {
 type table struct {
 	id uint64
 	r  *sstable.Reader
+	// cutoff, if non-zero, hides every version newer than it. A branch made
+	// of a past state inherits its parent's tables with a cutoff.
+	cutoff uint64
 }
+
+// get returns the newest entry for key at or before asOf, honouring cutoff.
+func (t *table) get(key []byte, asOf uint64) (base.Entry, bool, error) {
+	if t.cutoff != 0 && asOf > t.cutoff {
+		asOf = t.cutoff
+	}
+	return t.r.Get(key, asOf)
+}
+
+// iterator returns the table's entries >= start, honouring cutoff.
+func (t *table) iterator(start []byte) base.Iterator {
+	it := t.r.Iterator(start)
+	if t.cutoff == 0 {
+		return it
+	}
+	return &cutoffIterator{in: it, cutoff: t.cutoff}
+}
+
+type cutoffIterator struct {
+	in     base.Iterator
+	cutoff uint64
+}
+
+func (c *cutoffIterator) Next() bool {
+	for c.in.Next() {
+		if c.in.Entry().Version <= c.cutoff {
+			return true
+		}
+	}
+	return false
+}
+func (c *cutoffIterator) Entry() *base.Entry { return c.in.Entry() }
+func (c *cutoffIterator) Err() error         { return c.in.Err() }
 
 type immutable struct {
 	mem     *memtable.Memtable
@@ -214,7 +250,7 @@ func (db *DB) recover() error {
 			return err
 		}
 		r.SetCache(id, db.cache)
-		db.tables = append(db.tables, &table{id: id, r: r})
+		db.tables = append(db.tables, &table{id: id, r: r, cutoff: m.Cutoffs[id]})
 		live[id] = true
 	}
 
@@ -287,6 +323,12 @@ func (db *DB) saveManifestLocked() error {
 	m := manifest{Format: formatVersion, NextFile: db.nextFile.Load(), LastVersion: db.lastVersion.Load(), Tables: []uint64{}}
 	for _, t := range db.tables {
 		m.Tables = append(m.Tables, t.id)
+		if t.cutoff != 0 {
+			if m.Cutoffs == nil {
+				m.Cutoffs = make(map[uint64]uint64)
+			}
+			m.Cutoffs[t.id] = t.cutoff
+		}
 	}
 	return writeManifest(db.dir, m)
 }
@@ -761,7 +803,7 @@ func (db *DB) lookup(key []byte, asOf uint64) (base.Entry, bool, error) {
 		}
 	}
 	for _, t := range db.tables {
-		e, ok, err := t.r.Get(key, asOf)
+		e, ok, err := t.get(key, asOf)
 		if err != nil || ok {
 			return e, ok, err
 		}
@@ -803,7 +845,7 @@ func (db *DB) iterators(start []byte) []base.Iterator {
 		iters = append(iters, im.mem.Iterator(start))
 	}
 	for _, t := range db.tables {
-		iters = append(iters, t.r.Iterator(start))
+		iters = append(iters, t.iterator(start))
 	}
 	return iters
 }
@@ -855,7 +897,7 @@ func (db *DB) History(key []byte, fn func(v Version) bool) error {
 		iters = append(iters, im.mem.Versions(key))
 	}
 	for _, t := range db.tables {
-		iters = append(iters, t.r.Iterator(key))
+		iters = append(iters, t.iterator(key))
 	}
 	m := newMergeIterator(iters)
 	for m.Next() {

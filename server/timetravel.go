@@ -76,7 +76,7 @@ func cmdAsOf(c *ctx) {
 		c.w.WriteError("ERR wrong number of arguments for '" + name + "' command")
 		return
 	}
-	cmd.fn(&ctx{s: c.s, st: c.st.AsOf(at), w: c.w, args: args, at: at})
+	cmd.fn(&ctx{s: c.s, st: c.st.AsOf(at), conn: c.conn, w: c.w, args: args, at: at})
 }
 
 // cmdHistory is an emberkv extension: HISTORY <key> [COUNT n] lists the key's

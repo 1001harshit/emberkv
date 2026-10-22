@@ -24,6 +24,9 @@ type manifest struct {
 	NextFile    uint64   `json:"next_file"`
 	LastVersion uint64   `json:"last_version"` // newest version assigned to a write
 	Tables      []uint64 `json:"tables"`       // table ids, newest first
+	// Cutoffs hides versions newer than the given one in a table (see
+	// table.cutoff); only tables inherited by a branch have one.
+	Cutoffs map[uint64]uint64 `json:"cutoffs,omitempty"`
 }
 
 func readManifest(dir string) (manifest, error) {

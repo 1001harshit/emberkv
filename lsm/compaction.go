@@ -129,7 +129,7 @@ func (db *DB) Compact() error {
 func (db *DB) compactRun(inputs []*table, bottom bool) error {
 	iters := make([]base.Iterator, len(inputs))
 	for i, t := range inputs {
-		iters[i] = t.r.Iterator(nil)
+		iters[i] = t.iterator(nil)
 	}
 	var drop func(*base.Entry) bool
 	if f := db.opts.CompactionFilter; f != nil {

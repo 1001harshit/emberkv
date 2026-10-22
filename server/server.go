@@ -22,10 +22,11 @@ var Version = "dev"
 
 // Server serves Redis-protocol clients from one database.
 type Server struct {
-	st      *keyspace.Store
-	logger  *log.Logger
-	started time.Time
-	cursors *cursorTable
+	st       *keyspace.Store
+	branches *Branches // nil unless EnableBranches was called
+	logger   *log.Logger
+	started  time.Time
+	cursors  *cursorTable
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -150,7 +151,8 @@ func (s *Server) handle(conn net.Conn) {
 	// whole batch durable, so a pipeline of N writes costs one log write
 	// while no reply ever reports a write that could still be lost.
 	var pending keyspace.Pending
-	st := s.st.Session(&pending)
+	cs := &connState{pending: &pending}
+	cs.use(MainBranch, s.st)
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
@@ -164,7 +166,7 @@ func (s *Server) handle(conn net.Conn) {
 			continue
 		}
 		s.totalCmds.Add(1)
-		quit := s.dispatch(st, w, args)
+		quit := s.dispatch(cs, w, args)
 		// Reply only when no pipelined commands are waiting, so a pipeline of
 		// N commands costs one log write and one network write instead of N.
 		if quit || r.Buffered() == 0 {
@@ -184,7 +186,18 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) dispatch(st *keyspace.Store, w *resp.Writer, args [][]byte) (quit bool) {
+// connState is what a connection remembers between commands.
+type connState struct {
+	branch  string
+	st      *keyspace.Store // a session on the branch's store
+	pending *keyspace.Pending
+}
+
+func (cs *connState) use(branch string, st *keyspace.Store) {
+	cs.branch, cs.st = branch, st.Session(cs.pending)
+}
+
+func (s *Server) dispatch(cs *connState, w *resp.Writer, args [][]byte) (quit bool) {
 	name := strings.ToLower(string(args[0]))
 	cmd, ok := commands[name]
 	if !ok {
@@ -195,7 +208,7 @@ func (s *Server) dispatch(st *keyspace.Store, w *resp.Writer, args [][]byte) (qu
 		w.WriteError("ERR wrong number of arguments for '" + name + "' command")
 		return false
 	}
-	c := &ctx{s: s, st: st, w: w, args: args}
+	c := &ctx{s: s, st: cs.st, conn: cs, w: w, args: args}
 	cmd.fn(c)
 	return c.quit
 }

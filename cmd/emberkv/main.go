@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime/pprof"
 	"syscall"
 	"time"
@@ -49,14 +50,15 @@ func main() {
 		logger.Fatal(err)
 	}
 
-	st, err := keyspace.Open(*dir, lsm.Options{
+	opts := lsm.Options{
 		MemtableSize:      *memtableMB << 20,
 		SyncMode:          mode,
 		CompactionTrigger: *trigger,
 		BlockCacheSize:    blockCacheBytes(*cacheMB),
 		History:           *history,
 		Logger:            logger,
-	})
+	}
+	st, err := keyspace.Open(*dir, opts)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -67,6 +69,14 @@ func main() {
 		logger.Fatal(err)
 	}
 	srv := server.New(st, logger)
+	branches, err := server.OpenBranches(st, filepath.Join(*dir, "branches"), func(path string) (*keyspace.Store, error) {
+		return keyspace.Open(path, opts)
+	})
+	if err != nil {
+		st.Close()
+		logger.Fatal(err)
+	}
+	srv.EnableBranches(branches)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
@@ -78,6 +88,9 @@ func main() {
 
 	logger.Printf("listening on %s (data dir %q, fsync %s, history %v)", ln.Addr(), *dir, mode, *history)
 	if err := srv.Serve(ln); err != nil {
+		logger.Print(err)
+	}
+	if err := branches.Close(); err != nil {
 		logger.Print(err)
 	}
 	if err := st.Close(); err != nil {
