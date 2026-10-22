@@ -269,3 +269,41 @@ func TestSurvivesReopen(t *testing.T) {
 		t.Fatalf("SMembers = %s", m)
 	}
 }
+
+// TestBlindWriteDoesNotInterleaveWithReadModifyWrite races SET against
+// HINCRBY on the same key. Without the key lock, a SET could land between
+// HINCRBY's read and write and be silently overwritten; with it, the
+// operations serialise and the key's metadata always matches its fields.
+func TestBlindWriteDoesNotInterleaveWithReadModifyWrite(t *testing.T) {
+	s := open(t, lsm.Options{})
+	for trial := 0; trial < 200; trial++ {
+		key := b(fmt.Sprintf("k%d", trial))
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := s.HIncrBy(key, b("n"), 1); err != nil && !errors.Is(err, ErrWrongType) {
+					t.Error(err)
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				s.Delete(key)
+			}
+		}()
+		wg.Wait()
+		// The key's metadata and its fields must agree: if it is a hash, the
+		// field it reports must exist under the live version.
+		if typ, _ := s.Type(key); typ == TypeHash {
+			n, _ := s.HLen(key)
+			var fields int
+			s.HGetAll(key, func([]byte, []byte) { fields++ })
+			if int64(fields) != n {
+				t.Fatalf("trial %d: HLEN %d but %d fields", trial, n, fields)
+			}
+		}
+	}
+}

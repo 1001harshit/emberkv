@@ -14,6 +14,9 @@
 // deleting, overwriting or expiring a hash of any size is one metadata write:
 // the old fields keep their stale version and are never read again. A
 // compaction filter later removes them from disk.
+//
+// Every write locks its user key (lsm.DB.TxnKeys), so operations on the same
+// key are serialised while operations on different keys run in parallel.
 package keyspace
 
 import (
@@ -244,7 +247,7 @@ func (s *Store) Exists(key []byte) (bool, error) {
 // and sets this is a single write regardless of size.
 func (s *Store) Delete(key []byte) (bool, error) {
 	existed := false
-	err := s.db.Txn(func(tx *lsm.Txn) error {
+	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil || m == nil {
 			return err
@@ -270,7 +273,7 @@ func (s *Store) ExpireAt(key []byte) (int64, bool, error) {
 // at or before now deletes the key. It reports whether the key existed.
 func (s *Store) UpdateExpiry(key []byte, fn func(expireAt int64) (next int64, write bool)) (bool, error) {
 	existed := false
-	err := s.db.Txn(func(tx *lsm.Txn) error {
+	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil || m == nil {
 			return err
@@ -324,11 +327,13 @@ func (s *Store) FlushAll() error {
 	}
 	for len(keys) > 0 {
 		n := min(len(keys), 1000)
-		b := new(lsm.Batch)
-		for _, k := range keys[:n] {
-			b.Delete(metaKey(k))
-		}
-		if err := s.db.Write(b); err != nil {
+		chunk := keys[:n]
+		if err := s.db.TxnKeys(chunk, func(tx *lsm.Txn) error {
+			for _, k := range chunk {
+				tx.Delete(metaKey(k))
+			}
+			return nil
+		}); err != nil {
 			return err
 		}
 		keys = keys[n:]
@@ -365,7 +370,7 @@ func (s *Store) Update(key []byte, fn func(cur *lsm.Item) (next *lsm.Item, write
 // SetUpdate is Update for commands like SET that may overwrite a key of any
 // type: fn is told whether the key currently holds a non-string (other).
 func (s *Store) SetUpdate(key []byte, fn func(cur *lsm.Item, other bool) (next *lsm.Item, write bool, err error)) error {
-	return s.db.Txn(func(tx *lsm.Txn) error {
+	return s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil {
 			return err
@@ -393,16 +398,26 @@ func (s *Store) SetUpdate(key []byte, fn func(cur *lsm.Item, other bool) (next *
 
 // MSet sets several strings atomically, overwriting keys of any type.
 func (s *Store) MSet(pairs [][]byte) error {
-	b := new(lsm.Batch)
+	var keys [][]byte
 	for i := 0; i+1 < len(pairs); i += 2 {
-		m := meta{typ: TypeString, value: pairs[i+1]}
-		b.Set(metaKey(pairs[i]), m.encode(), 0)
+		keys = append(keys, pairs[i])
 	}
-	return s.db.Write(b)
+	return s.db.TxnKeys(keys, func(tx *lsm.Txn) error {
+		for i := 0; i+1 < len(pairs); i += 2 {
+			m := meta{typ: TypeString, value: pairs[i+1]}
+			tx.Set(metaKey(pairs[i]), m.encode(), 0)
+		}
+		return nil
+	})
 }
 
-// SetEx sets a string with an expiry (unix ms, 0 for none), overwriting any type.
+// SetEx sets a string with an expiry (unix ms, 0 for none), overwriting any
+// type. It is a blind write, but still takes the key's lock so it cannot land
+// between another operation's read and write of the same key.
 func (s *Store) SetEx(key, value []byte, expireAt int64) error {
-	m := meta{typ: TypeString, value: value}
-	return s.db.Write(new(lsm.Batch).Set(metaKey(key), m.encode(), expireAt))
+	return s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+		m := meta{typ: TypeString, value: value}
+		tx.Set(metaKey(key), m.encode(), expireAt)
+		return nil
+	})
 }

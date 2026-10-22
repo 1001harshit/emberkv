@@ -515,3 +515,90 @@ func TestCompactionFilter(t *testing.T) {
 	mustMissing(t, db, "tmp:7")
 	mustGet(t, db, "keep:7", "x")
 }
+
+func TestParallelUpdatesOnManyKeys(t *testing.T) {
+	db := mustOpen(t, t.TempDir(), smallOpts())
+	defer db.Close()
+	const goroutines, keys, rounds = 16, 64, 50
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for r := 0; r < rounds; r++ {
+				for k := 0; k < keys; k++ {
+					key := []byte(fmt.Sprintf("c%d", (k+g)%keys))
+					err := db.Update(key, func(cur *Item) (*Item, bool, error) {
+						n := 0
+						if cur != nil {
+							fmt.Sscan(string(cur.Value), &n)
+						}
+						return &Item{Value: []byte(fmt.Sprint(n + 1))}, true, nil
+					})
+					if err != nil {
+						t.Error(err)
+						return
+					}
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	for k := 0; k < keys; k++ {
+		mustGet(t, db, fmt.Sprintf("c%d", k), fmt.Sprint(goroutines*rounds))
+	}
+}
+
+// TestTxnKeysOverlapping moves money between random pairs of accounts from
+// many goroutines. Overlapping lock sets must neither deadlock nor lose an
+// update, so the total stays constant.
+func TestTxnKeysOverlapping(t *testing.T) {
+	db := mustOpen(t, t.TempDir(), smallOpts())
+	defer db.Close()
+	const accounts = 20
+	for i := 0; i < accounts; i++ {
+		db.Put([]byte(fmt.Sprintf("acct%d", i)), []byte("100"))
+	}
+	done := make(chan struct{})
+	go func() {
+		var wg sync.WaitGroup
+		for g := 0; g < 8; g++ {
+			wg.Add(1)
+			go func(g int) {
+				defer wg.Done()
+				rnd := rand.New(rand.NewSource(int64(g)))
+				for i := 0; i < 300; i++ {
+					a, b := rnd.Intn(accounts), rnd.Intn(accounts)
+					ka, kb := []byte(fmt.Sprintf("acct%d", a)), []byte(fmt.Sprintf("acct%d", b))
+					db.TxnKeys([][]byte{ka, kb}, func(tx *Txn) error {
+						var x, y int
+						va, _ := tx.Get(ka)
+						fmt.Sscan(string(va.Value), &x)
+						tx.Set(ka, []byte(fmt.Sprint(x-1)), 0)
+						vb, _ := tx.Get(kb) // sees the write above when a == b
+						fmt.Sscan(string(vb.Value), &y)
+						tx.Set(kb, []byte(fmt.Sprint(y+1)), 0)
+						return nil
+					})
+				}
+			}(g)
+		}
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("transactions deadlocked")
+	}
+	total := 0
+	for i := 0; i < accounts; i++ {
+		v, _ := db.Get([]byte(fmt.Sprintf("acct%d", i)))
+		var n int
+		fmt.Sscan(string(v), &n)
+		total += n
+	}
+	if total != accounts*100 {
+		t.Fatalf("total = %d, want %d", total, accounts*100)
+	}
+}

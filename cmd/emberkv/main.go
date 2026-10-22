@@ -21,7 +21,7 @@ func main() {
 	dir := flag.String("dir", "data", "data directory")
 	fsync := flag.String("fsync", "everysec", "WAL fsync policy: always, everysec or no")
 	memtableMB := flag.Int("memtable-mb", 4, "memtable size in MiB before it is flushed to disk")
-	trigger := flag.Int("compaction-trigger", 4, "tables per tier before they are merged")
+	trigger := flag.Int("compaction-trigger", 4, "number of SSTables before background compaction starts")
 	version := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 

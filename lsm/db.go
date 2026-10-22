@@ -11,6 +11,7 @@ package lsm
 import (
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"log"
 	"os"
@@ -107,12 +108,15 @@ type DB struct {
 	opts Options
 	lock *os.File
 
-	// writeMu serialises writers, which makes read-modify-write (Update) atomic.
-	writeMu sync.Mutex
+	// locks serialises writers that touch the same keys; see locks.go.
+	locks keyLocks
+	// appendMu serialises the short step that appends to the WAL buffer and
+	// the memtable, so the log records writes in the order they happen.
+	appendMu sync.Mutex
 	// compactMu ensures only one compaction runs at a time.
 	compactMu sync.Mutex
 
-	// mu guards the fields below. Lock order: writeMu, compactMu, mu.
+	// mu guards the fields below. Lock order: key locks, appendMu, compactMu, mu.
 	mu      sync.RWMutex
 	stall   *sync.Cond
 	mem     *memtable.Memtable
@@ -153,6 +157,7 @@ func Open(dir string, opts Options) (*DB, error) {
 		closing:   make(chan struct{}),
 	}
 	db.stall = sync.NewCond(&db.mu)
+	db.locks.seed = maphash.MakeSeed()
 	if err := db.recover(); err != nil {
 		for _, t := range db.tables {
 			t.r.Close()
@@ -353,11 +358,15 @@ func (db *DB) Delete(key []byte) error {
 }
 
 // Write applies every write in b atomically: after a crash, either all or
-// none of them are recovered.
+// none of them are recovered. It takes the key locks of every key in b.
 func (db *DB) Write(b *Batch) error {
-	db.writeMu.Lock()
-	c, err := db.applyLocked(b.entries)
-	db.writeMu.Unlock()
+	keys := make([][]byte, len(b.entries))
+	for i := range b.entries {
+		keys[i] = b.entries[i].Key
+	}
+	unlock := db.locks.lock(keys)
+	c, err := db.apply(b.entries)
+	unlock()
 	if err != nil {
 		return err
 	}
@@ -376,8 +385,7 @@ func (db *DB) Update(key []byte, fn func(cur *Item) (next *Item, write bool, err
 }
 
 func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commit, error) {
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
+	defer db.locks.lock([][]byte{key})()
 
 	var cur *Item
 	item, err := db.GetItem(key)
@@ -397,7 +405,7 @@ func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commi
 	} else if cur == nil {
 		return commit{}, nil // deleting a key that is already gone
 	}
-	return db.applyLocked([]base.Entry{e})
+	return db.apply([]base.Entry{e})
 }
 
 // Txn is a read-modify-write transaction over any number of keys. It sees
@@ -442,18 +450,31 @@ func (tx *Txn) Delete(key []byte) {
 	tx.put(base.Entry{Key: key, Kind: base.KindDelete})
 }
 
-// Txn runs fn with exclusive access to the write path and atomically applies
-// the writes it stages, unless fn returns an error. Reads made through tx are
-// consistent with its writes because no other writer runs concurrently.
+// Txn runs fn with exclusive access to every key and atomically applies the
+// writes it stages, unless fn returns an error. Prefer TxnKeys, which only
+// excludes writers of the same keys.
 func (db *DB) Txn(fn func(tx *Txn) error) error {
-	db.writeMu.Lock()
+	return db.txn(db.locks.lockAll(), fn)
+}
+
+// TxnKeys is Txn holding only the key locks for lockKeys: transactions with
+// disjoint lock keys run their reads and logic in parallel. Every write that
+// fn stages, and every key whose value fn's decision depends on, must be
+// covered by lockKeys, in the sense that all other writers of that data lock
+// the same keys. A layer above may use its own lock keys, e.g. a user key
+// that stands for several internal records.
+func (db *DB) TxnKeys(lockKeys [][]byte, fn func(tx *Txn) error) error {
+	return db.txn(db.locks.lock(lockKeys), fn)
+}
+
+func (db *DB) txn(unlock func(), fn func(tx *Txn) error) error {
 	tx := &Txn{db: db}
 	err := fn(tx)
 	var c commit
 	if err == nil {
-		c, err = db.applyLocked(tx.entries)
+		c, err = db.apply(tx.entries)
 	}
-	db.writeMu.Unlock()
+	unlock()
 	if err != nil {
 		return err
 	}
@@ -475,8 +496,13 @@ func (c commit) wait() error {
 	return c.w.Commit(c.lsn)
 }
 
-// applyLocked appends entries to the WAL buffer and the memtable. The caller
-// holds writeMu and must call wait on the result after releasing it.
+// apply appends entries to the WAL buffer and the memtable. The caller holds
+// the key locks of the entries and must call wait on the result after
+// releasing them.
+//
+// Only this step is serialised across all writers (by appendMu), and it does
+// no I/O. Reads and logic of a transaction run before it, in parallel with
+// writers of other keys.
 //
 // This is group commit with early lock release: the next writer can apply
 // its changes while this one waits for I/O, and one leader writes and
@@ -484,10 +510,12 @@ func (c commit) wait() error {
 // a write slightly before it is durable (as in Redis), but a client is only
 // acknowledged once its write is durable, and the log preserves order, so a
 // crash can only lose a suffix of unacknowledged writes.
-func (db *DB) applyLocked(entries []base.Entry) (commit, error) {
+func (db *DB) apply(entries []base.Entry) (commit, error) {
 	if len(entries) == 0 {
 		return commit{}, nil
 	}
+	db.appendMu.Lock()
+	defer db.appendMu.Unlock()
 	db.mu.RLock()
 	closed, bgErr := db.closed, db.bgErr
 	db.mu.RUnlock()
@@ -515,7 +543,7 @@ func (db *DB) applyLocked(entries []base.Entry) (commit, error) {
 }
 
 // rotate freezes the current memtable and starts a new memtable and log.
-// The caller holds writeMu.
+// The caller holds appendMu.
 func (db *DB) rotate() error {
 	path := db.walFilePath(db.newFileID())
 	w, err := wal.Create(path, db.opts.SyncMode)
@@ -550,8 +578,8 @@ func (db *DB) rotate() error {
 // Flush writes the memtable to an SSTable and waits until every frozen
 // memtable has been flushed.
 func (db *DB) Flush() error {
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
+	db.appendMu.Lock()
+	defer db.appendMu.Unlock()
 	db.mu.RLock()
 	closed := db.closed
 	db.mu.RUnlock()
@@ -748,8 +776,9 @@ func (db *DB) Stats() Stats {
 // Close stops background work and releases the database. Unflushed writes are
 // safe in the write-ahead log and are recovered by the next Open.
 func (db *DB) Close() error {
-	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
+	// Waiting for appendMu lets any in-flight apply finish; later ones see closed.
+	db.appendMu.Lock()
+	defer db.appendMu.Unlock()
 
 	db.mu.Lock()
 	if db.closed {
