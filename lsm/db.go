@@ -850,7 +850,14 @@ func (db *DB) History(key []byte, fn func(v Version) bool) error {
 	if db.closed {
 		return ErrClosed
 	}
-	m := newMergeIterator(db.iterators(key))
+	iters := []base.Iterator{db.mem.Versions(key)}
+	for _, im := range db.imm {
+		iters = append(iters, im.mem.Versions(key))
+	}
+	for _, t := range db.tables {
+		iters = append(iters, t.r.Iterator(key))
+	}
+	m := newMergeIterator(iters)
 	for m.Next() {
 		e := m.Entry()
 		if !bytes.Equal(e.Key, key) {

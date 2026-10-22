@@ -130,6 +130,18 @@ func (m *Memtable) Len() int {
 	return m.count
 }
 
+// Versions returns an iterator over a snapshot of the versions of key alone,
+// newest first. Unlike Iterator it copies nothing else.
+func (m *Memtable) Versions(key []byte) base.Iterator {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var entries []base.Entry
+	for n := m.findGE(key, base.MaxVersion, nil); n != nil && bytes.Equal(n.entry.Key, key); n = n.next[0] {
+		entries = append(entries, n.entry)
+	}
+	return base.NewSliceIterator(entries)
+}
+
 // Iterator returns an iterator over a point-in-time snapshot of every
 // version of every key >= start (nil means from the beginning).
 func (m *Memtable) Iterator(start []byte) base.Iterator {

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"runtime/pprof"
 	"syscall"
+	"time"
 
 	"github.com/1001harshit/emberkv/internal/wal"
 	"github.com/1001harshit/emberkv/keyspace"
@@ -24,6 +25,7 @@ func main() {
 	memtableMB := flag.Int("memtable-mb", 4, "memtable size in MiB before it is flushed to disk")
 	trigger := flag.Int("compaction-trigger", 4, "number of SSTables before background compaction starts")
 	cacheMB := flag.Int("block-cache-mb", 64, "memory for caching SSTable blocks, in MiB (0 disables)")
+	history := flag.Duration("history", time.Hour, "how far back ASOF, HISTORY and ROLLBACK can reach (0 keeps no history)")
 	version := flag.Bool("version", false, "print version and exit")
 	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile to this file until shutdown")
 	flag.Parse()
@@ -52,6 +54,7 @@ func main() {
 		SyncMode:          mode,
 		CompactionTrigger: *trigger,
 		BlockCacheSize:    blockCacheBytes(*cacheMB),
+		History:           *history,
 		Logger:            logger,
 	})
 	if err != nil {
@@ -73,7 +76,7 @@ func main() {
 		srv.Close()
 	}()
 
-	logger.Printf("listening on %s (data dir %q, fsync %s)", ln.Addr(), *dir, mode)
+	logger.Printf("listening on %s (data dir %q, fsync %s, history %v)", ln.Addr(), *dir, mode, *history)
 	if err := srv.Serve(ln); err != nil {
 		logger.Print(err)
 	}

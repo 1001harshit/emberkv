@@ -88,7 +88,7 @@ func (c *container) save() {
 
 // readContainer returns the live metadata for a hash or set, or nil.
 func (s *Store) readContainer(key []byte, typ Type) (*meta, error) {
-	m, err := loadMeta(s.db, key)
+	m, err := loadMeta(s, key)
 	if err != nil || m == nil {
 		return nil, err
 	}
@@ -101,7 +101,7 @@ func (s *Store) readContainer(key []byte, typ Type) (*meta, error) {
 // members calls fn for each field and value of the container at m.
 func (s *Store) members(key []byte, m *meta, fn func(field, value []byte)) error {
 	prefix := memberPrefixOf(key, m.version)
-	return s.db.Scan(prefix, func(k []byte, item lsm.Item) bool {
+	return s.db.ScanAt(prefix, s.at, func(k []byte, item lsm.Item) bool {
 		if !bytes.HasPrefix(k, prefix) {
 			return false
 		}
@@ -115,7 +115,7 @@ func (s *Store) readMember(key []byte, typ Type, field []byte) ([]byte, bool, er
 	if err != nil || m == nil {
 		return nil, false, err
 	}
-	item, err := s.db.GetItem(memberKey(key, m.version, field))
+	item, err := s.GetItem(memberKey(key, m.version, field))
 	if errors.Is(err, lsm.ErrNotFound) {
 		return nil, false, nil
 	}

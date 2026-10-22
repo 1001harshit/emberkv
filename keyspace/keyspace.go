@@ -160,7 +160,22 @@ func loadMeta(g getter, key []byte) (*meta, error) {
 type Store struct {
 	db      *lsm.DB
 	shared  *shared
-	pending *Pending // nil: each write waits for its own durability
+	pending *Pending  // nil: each write waits for its own durability
+	at      time.Time // zero: the present; otherwise a read-only view of the past
+}
+
+// ErrReadOnly is returned by writes through a view of the past.
+var ErrReadOnly = errors.New("ERR can't write to the past: ASOF only allows read commands")
+
+// AsOf returns a read-only view of the keyspace as it was at time t. Reads
+// older than the database's History window may see incomplete data.
+func (s *Store) AsOf(t time.Time) *Store {
+	return &Store{db: s.db, shared: s.shared, at: t}
+}
+
+// GetItem reads a raw record at the view's time; it makes Store a getter.
+func (s *Store) GetItem(key []byte) (lsm.Item, error) {
+	return s.db.GetItemAt(key, s.at)
 }
 
 // shared is the state every Session of a Store has in common.
@@ -169,10 +184,11 @@ type shared struct {
 
 	// The compaction filter remembers the last container it checked;
 	// consecutive member records almost always belong to the same container.
-	gcMu    sync.Mutex
-	gcKey   []byte
-	gcVer   uint64
-	gcStale bool
+	gcMu      sync.Mutex
+	gcKey     []byte
+	gcVer     uint64
+	gcStale   bool
+	gcChecked time.Time
 }
 
 // Pending collects writes that have been applied but may not be durable
@@ -206,6 +222,9 @@ func (s *Store) Session(p *Pending) *Store {
 // for durability unless the Store is a Session. It skips the transaction
 // machinery, which blind writes do not need.
 func (s *Store) write(keys [][]byte, b *lsm.Batch) error {
+	if !s.at.IsZero() {
+		return ErrReadOnly
+	}
 	if s.pending == nil {
 		return s.db.WriteKeys(keys, b)
 	}
@@ -219,6 +238,9 @@ func (s *Store) write(keys [][]byte, b *lsm.Batch) error {
 // txn runs a transaction locking keys, waiting for durability unless the
 // Store is a Session.
 func (s *Store) txn(keys [][]byte, fn func(*lsm.Txn) error) error {
+	if !s.at.IsZero() {
+		return ErrReadOnly
+	}
 	if s.pending == nil {
 		return s.db.TxnKeys(keys, fn)
 	}
@@ -264,33 +286,89 @@ func (s *Store) newVersion() uint64 {
 	}
 }
 
-// isGarbage reports whether a record is a member of a container that no
-// longer exists at that version. Versions are never reused, so once stale,
-// a member stays stale, which is what makes dropping it safe.
+// isGarbage reports whether a record is a field or member of a container
+// generation that no readable point in time can see: neither the key's
+// current metadata nor any metadata version inside the History window
+// (including the one in force at the window's start) refers to it.
+// Generations are never reused and the window only moves forward, so once
+// garbage, always garbage, which is what makes dropping it safe.
 func (s *Store) isGarbage(k []byte) bool {
-	key, version, ok := parseMemberKey(k)
+	key, gen, ok := parseMemberKey(k)
 	if !ok {
 		return false
 	}
 	s.shared.gcMu.Lock()
 	defer s.shared.gcMu.Unlock()
-	if s.shared.gcKey != nil && bytes.Equal(s.shared.gcKey, key) && s.shared.gcVer == version {
+	now := s.db.Now()
+	if s.shared.gcKey != nil && bytes.Equal(s.shared.gcKey, key) && s.shared.gcVer == gen &&
+		(s.shared.gcStale || now.Sub(s.shared.gcChecked) < time.Second) {
+		// "Garbage" never changes. "Still needed" can turn into garbage as
+		// the window moves, so it is trusted only briefly; keeping a record
+		// a little longer is always safe.
 		return s.shared.gcStale
 	}
-	m, err := loadMeta(s.db, key)
+	horizon := s.db.OldestReadable()
+	stale := true
+	err := s.db.History(metaKey(key), func(v lsm.Version) bool {
+		// A version can only show the fields while it is not expired, and
+		// readers start at the window's beginning at the earliest.
+		from := v.At
+		if from.Before(horizon) {
+			from = horizon
+		}
+		visible := !v.Deleted && (v.Item.ExpireAt == 0 || v.Item.ExpireAt > from.UnixMilli())
+		if visible {
+			if m, err := decodeMeta(v.Item); err == nil && (m.typ == TypeHash || m.typ == TypeSet) && m.version == gen {
+				stale = false
+				return false
+			}
+		}
+		// Keep going through the window; the first version at or before
+		// its start is the last one a reader can see.
+		return v.At.After(horizon)
+	})
 	if err != nil {
 		return false // when in doubt, keep
 	}
-	stale := m == nil || (m.typ != TypeHash && m.typ != TypeSet) || m.version != version
-	s.shared.gcKey, s.shared.gcVer, s.shared.gcStale = bytes.Clone(key), version, stale
+	s.shared.gcKey, s.shared.gcVer, s.shared.gcStale, s.shared.gcChecked = bytes.Clone(key), gen, stale, now
 	return stale
+}
+
+// Change is one past version of a key, as reported by History.
+type Change struct {
+	At    time.Time
+	Type  Type   // TypeNone for a deletion
+	Value []byte // strings
+	Size  int64  // hashes and sets: number of fields or members
+}
+
+// History calls fn with the key's past versions, newest first, until fn
+// returns false. Only versions inside the History window are guaranteed.
+func (s *Store) History(key []byte, fn func(c Change) bool) error {
+	var derr error
+	err := s.db.History(metaKey(key), func(v lsm.Version) bool {
+		c := Change{At: v.At}
+		if !v.Deleted {
+			m, err := decodeMeta(v.Item)
+			if err != nil {
+				derr = err
+				return false
+			}
+			c.Type, c.Value, c.Size = m.typ, m.value, m.size
+		}
+		return fn(c)
+	})
+	if err == nil {
+		err = derr
+	}
+	return err
 }
 
 // ---- generic key operations ----
 
 // Type returns the type of key, or TypeNone if it does not exist.
 func (s *Store) Type(key []byte) (Type, error) {
-	m, err := loadMeta(s.db, key)
+	m, err := loadMeta(s, key)
 	if err != nil || m == nil {
 		return TypeNone, err
 	}
@@ -321,7 +399,7 @@ func (s *Store) Delete(key []byte) (bool, error) {
 
 // ExpireAt returns the expiry of key (unix ms, 0 for none) and whether it exists.
 func (s *Store) ExpireAt(key []byte) (int64, bool, error) {
-	m, err := loadMeta(s.db, key)
+	m, err := loadMeta(s, key)
 	if err != nil || m == nil {
 		return 0, false, err
 	}
@@ -357,7 +435,7 @@ func (s *Store) UpdateExpiry(key []byte, fn func(expireAt int64) (next int64, wr
 // Scan calls fn for each key >= start in order, with its type, until fn
 // returns false. fn must not call methods on the Store.
 func (s *Store) Scan(start []byte, fn func(key []byte, t Type) bool) error {
-	return s.db.Scan(metaKey(start), func(k []byte, item lsm.Item) bool {
+	return s.db.ScanAt(metaKey(start), s.at, func(k []byte, item lsm.Item) bool {
 		if len(k) == 0 || k[0] != metaPrefix {
 			return false
 		}
@@ -404,7 +482,7 @@ func (s *Store) FlushAll() error {
 
 // Get returns the string stored at key, or nil if the key does not exist.
 func (s *Store) Get(key []byte) (*lsm.Item, error) {
-	m, err := loadMeta(s.db, key)
+	m, err := loadMeta(s, key)
 	if err != nil || m == nil {
 		return nil, err
 	}

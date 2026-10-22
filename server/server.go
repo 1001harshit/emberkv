@@ -191,7 +191,7 @@ func (s *Server) dispatch(st *keyspace.Store, w *resp.Writer, args [][]byte) (qu
 		w.WriteError(unknownCommandError(args))
 		return false
 	}
-	if (cmd.arity > 0 && len(args) != cmd.arity) || (cmd.arity < 0 && len(args) < -cmd.arity) {
+	if !cmd.arityOK(len(args)) {
 		w.WriteError("ERR wrong number of arguments for '" + name + "' command")
 		return false
 	}

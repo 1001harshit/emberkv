@@ -17,10 +17,11 @@ import (
 
 type ctx struct {
 	s    *Server
-	st   *keyspace.Store // this connection's session
+	st   *keyspace.Store // this connection's session, or a view of the past
 	w    *resp.Writer
 	args [][]byte
 	quit bool
+	at   time.Time // non-zero inside ASOF: the time being read
 }
 
 type command struct {
@@ -28,6 +29,10 @@ type command struct {
 	// arity follows Redis: N means exactly N arguments including the command
 	// name, -N means at least N.
 	arity int
+}
+
+func (cmd command) arityOK(n int) bool {
+	return (cmd.arity > 0 && n == cmd.arity) || (cmd.arity < 0 && n >= -cmd.arity)
 }
 
 var commands map[string]command
@@ -70,6 +75,8 @@ func init() {
 		"flushdb":   {cmdFlushDB, -1},
 		"flushall":  {cmdFlushDB, -1},
 		"compact":   {cmdCompact, 1},
+		"asof":      {cmdAsOf, -3},
+		"history":   {cmdHistory, -2},
 		"info":      {cmdInfo, -1},
 		"time":      {cmdTime, 1},
 		"command":   {cmdCommand, -1},
@@ -94,7 +101,15 @@ const (
 
 func (c *ctx) store() *keyspace.Store { return c.st }
 func (c *ctx) db() *lsm.DB            { return c.st.DB() }
-func (c *ctx) nowMs() int64           { return c.db().Now().UnixMilli() }
+
+// nowMs is the current time in unix ms, or the time being read inside ASOF,
+// so TTL and expiry are judged as they were then.
+func (c *ctx) nowMs() int64 {
+	if !c.at.IsZero() {
+		return c.at.UnixMilli()
+	}
+	return c.db().Now().UnixMilli()
+}
 
 func (c *ctx) fail(err error) {
 	var re replyErr
@@ -103,7 +118,7 @@ func (c *ctx) fail(err error) {
 		return
 	}
 	// These keyspace errors already carry their Redis error code.
-	for _, e := range []error{keyspace.ErrWrongType, keyspace.ErrNotInteger, keyspace.ErrOverflow} {
+	for _, e := range []error{keyspace.ErrWrongType, keyspace.ErrNotInteger, keyspace.ErrOverflow, keyspace.ErrReadOnly} {
 		if errors.Is(err, e) {
 			c.w.WriteError(e.Error())
 			return
@@ -780,6 +795,8 @@ func cmdInfo(c *ctx) {
 		line("block_cache_misses:%d", st.CacheMisses)
 		line("flushes:%d", st.Flushes)
 		line("compactions:%d", st.Compactions)
+		line("history_seconds:%d", int64(c.db().OldestReadable().Sub(c.db().Now()).Abs().Seconds()))
+		line("oldest_readable_ms:%d", c.db().OldestReadable().UnixMilli())
 		line("")
 	}
 	if want("keyspace") {
