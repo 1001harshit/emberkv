@@ -3,8 +3,10 @@
 package base
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"math"
 )
 
 // Kind distinguishes a value from a deletion marker (tombstone).
@@ -18,13 +20,52 @@ const (
 // ErrCorrupt is returned when on-disk data fails to decode or checksum.
 var ErrCorrupt = errors.New("emberkv: corrupt data")
 
-// Entry is a single versioned record. Newer entries shadow older ones with
-// the same key; a KindDelete entry shadows the key entirely.
+// Entry is a single versioned record. Every write gets a Version; a reader
+// at version V sees, for each key, the entry with the highest Version <= V.
+// A KindDelete entry hides the key from such readers.
 type Entry struct {
 	Key      []byte
 	Value    []byte
 	Kind     Kind
+	Version  uint64
 	ExpireAt int64 // unix milliseconds; 0 means no expiry
+}
+
+// Versions are hybrid timestamps: unix milliseconds in the high bits and a
+// counter in the low VersionCounterBits, so they order writes exactly while
+// still telling the time each write happened.
+const VersionCounterBits = 20
+
+// MaxVersion reads the latest version of everything.
+const MaxVersion = math.MaxUint64
+
+// VersionAt returns the highest version a write at unix millisecond ms can
+// have, i.e. the version to read at to see everything written by then.
+func VersionAt(ms int64) uint64 {
+	if ms < 0 {
+		return 0
+	}
+	return uint64(ms)<<VersionCounterBits | (1<<VersionCounterBits - 1)
+}
+
+// VersionTime returns the unix millisecond a version was written at.
+func VersionTime(v uint64) int64 {
+	return int64(v >> VersionCounterBits)
+}
+
+// Compare orders entries by key ascending, then version descending, so the
+// newest version of a key comes first.
+func Compare(aKey []byte, aVersion uint64, bKey []byte, bVersion uint64) int {
+	if c := bytes.Compare(aKey, bKey); c != 0 {
+		return c
+	}
+	switch {
+	case aVersion > bVersion:
+		return -1
+	case aVersion < bVersion:
+		return 1
+	}
+	return 0
 }
 
 // Expired reports whether the entry has a TTL that has passed at nowMs.
@@ -44,9 +85,10 @@ func (e *Entry) Size() int {
 
 // AppendEntry appends the encoding of e to dst:
 //
-//	kind(1) | expireAt(uvarint) | keyLen(uvarint) | key | valLen(uvarint) | value
+//	kind(1) | version(uvarint) | expireAt(uvarint) | keyLen(uvarint) | key | valLen(uvarint) | value
 func AppendEntry(dst []byte, e *Entry) []byte {
 	dst = append(dst, byte(e.Kind))
+	dst = binary.AppendUvarint(dst, e.Version)
 	dst = binary.AppendUvarint(dst, uint64(e.ExpireAt))
 	dst = binary.AppendUvarint(dst, uint64(len(e.Key)))
 	dst = append(dst, e.Key...)
@@ -67,6 +109,13 @@ func DecodeEntry(b []byte) (Entry, int, error) {
 		return Entry{}, 0, ErrCorrupt
 	}
 	n := 1
+
+	ver, m := binary.Uvarint(b[n:])
+	if m <= 0 {
+		return Entry{}, 0, ErrCorrupt
+	}
+	e.Version = ver
+	n += m
 
 	exp, m := binary.Uvarint(b[n:])
 	if m <= 0 {

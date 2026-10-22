@@ -9,6 +9,7 @@
 package lsm
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"hash/maphash"
@@ -57,8 +58,13 @@ type Options struct {
 	MaxImmutable int
 	// Logger receives background errors and events. Default discards.
 	Logger *log.Logger
-	// Now returns the current time; used for TTLs. Default time.Now.
+	// Now returns the current time; used for TTLs and write timestamps.
+	// Default time.Now.
 	Now func() time.Time
+	// History is how far back reads at a past time (GetItemAt, ScanAt,
+	// History) are guaranteed to work. Older versions are discarded by
+	// compaction. Zero keeps only what current reads need.
+	History time.Duration
 	// CompactionFilter, if set, is called for each value entry rewritten by a
 	// compaction; returning true drops the entry. It lets a layer above
 	// garbage-collect records that became unreachable, such as the fields of
@@ -135,7 +141,10 @@ type DB struct {
 	closed  bool
 
 	nextFile atomic.Uint64
-	cache    *cache.Cache // nil when disabled
+	// lastVersion is the version given to the latest write. It only grows;
+	// apply assigns versions under appendMu.
+	lastVersion atomic.Uint64
+	cache       *cache.Cache // nil when disabled
 
 	flushCh   chan struct{}
 	compactCh chan struct{}
@@ -234,6 +243,7 @@ func (db *DB) recover() error {
 		}
 	}
 	db.nextFile.Store(next)
+	db.lastVersion.Store(m.LastVersion)
 
 	// Replay logs oldest first; together they hold every write not yet in a table.
 	sort.Slice(wals, func(i, j int) bool { return wals[i] < wals[j] })
@@ -242,6 +252,9 @@ func (db *DB) recover() error {
 		_, err := wal.Replay(db.walFilePath(id), func(entries []base.Entry) error {
 			for _, e := range entries {
 				mem.Put(e)
+				if e.Version > db.lastVersion.Load() {
+					db.lastVersion.Store(e.Version)
+				}
 			}
 			return nil
 		})
@@ -255,7 +268,7 @@ func (db *DB) recover() error {
 			return err
 		}
 		db.tables = append([]*table{t}, db.tables...)
-		db.opts.Logger.Printf("recovered %d keys from write-ahead log", mem.Len())
+		db.opts.Logger.Printf("recovered %d writes from write-ahead log", mem.Len())
 	}
 	if err := db.saveManifestLocked(); err != nil {
 		return err
@@ -271,28 +284,27 @@ func (db *DB) recover() error {
 }
 
 func (db *DB) saveManifestLocked() error {
-	m := manifest{NextFile: db.nextFile.Load(), Tables: []uint64{}}
+	m := manifest{Format: formatVersion, NextFile: db.nextFile.Load(), LastVersion: db.lastVersion.Load(), Tables: []uint64{}}
 	for _, t := range db.tables {
 		m.Tables = append(m.Tables, t.id)
 	}
 	return writeManifest(db.dir, m)
 }
 
-// writeTable writes the entries from it to a new table. When bottom is true,
-// tombstones and expired entries are dropped; entries for which drop returns
-// true are dropped too. It returns nil if no entries remain.
-func (db *DB) writeTable(id uint64, it base.Iterator, bottom bool, drop func(*base.Entry) bool) (*table, error) {
+// writeTable writes the entries from it, in entry order, to a new table.
+// Versions older than the history window are discarded (see gcIterator);
+// when bottom is true, so are tombstones and expired entries that nothing
+// can see any more. Entries for which drop returns true are dropped too. It
+// returns nil if no entries remain.
+func (db *DB) writeTable(id uint64, src base.Iterator, bottom bool, drop func(*base.Entry) bool) (*table, error) {
 	path := db.tablePath(id)
 	w, err := sstable.Create(path, db.opts.BloomBitsPerKey)
 	if err != nil {
 		return nil, err
 	}
-	now := db.nowMs()
+	it := newGCIterator(src, db.horizon(), bottom)
 	for it.Next() {
 		e := it.Entry()
-		if bottom && !e.Live(now) {
-			continue
-		}
 		if drop != nil && e.Kind == base.KindSet && drop(e) {
 			continue
 		}
@@ -328,6 +340,20 @@ func signal(ch chan struct{}) {
 }
 
 func (db *DB) nowMs() int64 { return db.opts.Now().UnixMilli() }
+
+// horizon is the oldest version that reads must still be able to see.
+func (db *DB) horizon() uint64 {
+	return base.VersionAt(db.opts.Now().Add(-db.opts.History).UnixMilli())
+}
+
+// nextVersion returns a version for a new write: the current millisecond in
+// the high bits, bumped past the previous version if the clock has not
+// moved or went backwards. The caller holds appendMu.
+func (db *DB) nextVersion() uint64 {
+	v := max(uint64(db.nowMs())<<base.VersionCounterBits, db.lastVersion.Load()+1)
+	db.lastVersion.Store(v)
+	return v
+}
 
 // Now returns the current time according to the DB's clock, which is what
 // expiry times are compared against.
@@ -561,6 +587,12 @@ func (db *DB) apply(entries []base.Entry) (Commit, error) {
 	if bgErr != nil {
 		return Commit{}, bgErr
 	}
+	// Every entry of a batch gets the same version, so readers at any time
+	// see all of the batch or none of it.
+	v := db.nextVersion()
+	for i := range entries {
+		entries[i].Version = v
+	}
 	w := db.wal
 	lsn, err := w.Append(entries...)
 	if err != nil {
@@ -698,22 +730,38 @@ func (db *DB) flush(im *immutable) error {
 
 // ---- reads ----
 
-func (db *DB) lookup(key []byte) (base.Entry, bool, error) {
+// latest reads the newest version of everything.
+var latest = time.Time{}
+
+// readPoint converts a read time to the version to read at and the unix
+// millisecond at which expiry is judged. The zero time means now.
+func (db *DB) readPoint(at time.Time) (uint64, int64) {
+	if at.IsZero() {
+		return base.MaxVersion, db.nowMs()
+	}
+	ms := at.UnixMilli()
+	return base.VersionAt(ms), ms
+}
+
+// lookup returns the newest entry for key with a version <= asOf. Sources
+// are checked newest first: every version in a newer source is newer than
+// any version of the same key in an older one, so the first hit wins.
+func (db *DB) lookup(key []byte, asOf uint64) (base.Entry, bool, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	if db.closed {
 		return base.Entry{}, false, ErrClosed
 	}
-	if e, ok := db.mem.Get(key); ok {
+	if e, ok := db.mem.Get(key, asOf); ok {
 		return e, true, nil
 	}
 	for _, im := range db.imm {
-		if e, ok := im.mem.Get(key); ok {
+		if e, ok := im.mem.Get(key, asOf); ok {
 			return e, true, nil
 		}
 	}
 	for _, t := range db.tables {
-		e, ok, err := t.r.Get(key)
+		e, ok, err := t.r.Get(key, asOf)
 		if err != nil || ok {
 			return e, ok, err
 		}
@@ -729,24 +777,27 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 // GetItem returns the value and expiry stored for key, or ErrNotFound.
 func (db *DB) GetItem(key []byte) (Item, error) {
-	e, ok, err := db.lookup(key)
+	return db.GetItemAt(key, latest)
+}
+
+// GetItemAt returns key's value and expiry as they were at time at (the zero
+// time means now), or ErrNotFound. Times older than the History window may
+// return wrong results once compaction has discarded their versions.
+func (db *DB) GetItemAt(key []byte, at time.Time) (Item, error) {
+	asOf, nowMs := db.readPoint(at)
+	e, ok, err := db.lookup(key, asOf)
 	if err != nil {
 		return Item{}, err
 	}
-	if !ok || !e.Live(db.nowMs()) {
+	if !ok || !e.Live(nowMs) {
 		return Item{}, ErrNotFound
 	}
 	return Item{Value: e.Value, ExpireAt: e.ExpireAt}, nil
 }
 
-// Scan calls fn for each live key >= start (nil for all) in ascending order,
-// until fn returns false. fn must not call methods on db.
-func (db *DB) Scan(start []byte, fn func(key []byte, item Item) bool) error {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	if db.closed {
-		return ErrClosed
-	}
+// iterators returns iterators over every source, newest first. The caller
+// holds mu.RLock.
+func (db *DB) iterators(start []byte) []base.Iterator {
 	iters := []base.Iterator{db.mem.Iterator(start)}
 	for _, im := range db.imm {
 		iters = append(iters, im.mem.Iterator(start))
@@ -754,14 +805,63 @@ func (db *DB) Scan(start []byte, fn func(key []byte, item Item) bool) error {
 	for _, t := range db.tables {
 		iters = append(iters, t.r.Iterator(start))
 	}
-	now := db.nowMs()
-	m := newMergeIterator(iters)
-	for m.Next() {
-		e := m.Entry()
-		if !e.Live(now) {
+	return iters
+}
+
+// Scan calls fn for each live key >= start (nil for all) in ascending order,
+// until fn returns false. fn must not call methods on db.
+func (db *DB) Scan(start []byte, fn func(key []byte, item Item) bool) error {
+	return db.ScanAt(start, latest, fn)
+}
+
+// ScanAt is Scan of the data as it was at time at (the zero time means now).
+func (db *DB) ScanAt(start []byte, at time.Time, fn func(key []byte, item Item) bool) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return ErrClosed
+	}
+	asOf, nowMs := db.readPoint(at)
+	v := newVisibleIterator(newMergeIterator(db.iterators(start)), asOf)
+	for v.Next() {
+		e := v.Entry()
+		if !e.Live(nowMs) {
 			continue
 		}
 		if !fn(e.Key, Item{Value: e.Value, ExpireAt: e.ExpireAt}) {
+			break
+		}
+	}
+	return v.Err()
+}
+
+// Version describes one stored version of a key.
+type Version struct {
+	At      time.Time // when it was written
+	Deleted bool      // a deletion rather than a value
+	Item    Item
+}
+
+// History calls fn for each stored version of key, newest first, until fn
+// returns false. Versions older than the History window may already be gone.
+func (db *DB) History(key []byte, fn func(v Version) bool) error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed {
+		return ErrClosed
+	}
+	m := newMergeIterator(db.iterators(key))
+	for m.Next() {
+		e := m.Entry()
+		if !bytes.Equal(e.Key, key) {
+			break
+		}
+		v := Version{
+			At:      time.UnixMilli(base.VersionTime(e.Version)),
+			Deleted: e.Kind == base.KindDelete,
+			Item:    Item{Value: e.Value, ExpireAt: e.ExpireAt},
+		}
+		if !fn(v) {
 			break
 		}
 	}
@@ -773,6 +873,12 @@ func (db *DB) Count() (int, error) {
 	n := 0
 	err := db.Scan(nil, func([]byte, Item) bool { n++; return true })
 	return n, err
+}
+
+// OldestReadable returns the earliest time reads in the past are guaranteed
+// to be correct for, given the History setting.
+func (db *DB) OldestReadable() time.Time {
+	return db.opts.Now().Add(-db.opts.History)
 }
 
 // TableInfo describes one SSTable.

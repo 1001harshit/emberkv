@@ -5,8 +5,11 @@
 //	[data block]...[data block][index block][bloom filter][footer]
 //
 // A data block is a run of encoded entries (~4 KiB) followed by a crc32c.
-// The index block lists each data block's first key, offset and length,
-// followed by a crc32c. The 48-byte footer locates the index and filter:
+// Entries are sorted by key ascending, then version descending, and a table
+// may hold several versions of a key. The index block lists each data
+// block's first key and version, offset and length, followed by a crc32c.
+// The Bloom filter covers user keys. The 48-byte footer locates the index and
+// filter:
 //
 //	indexOff(8) | indexLen(8) | bloomOff(8) | bloomLen(8) | count(8) | magic(8)
 package sstable
@@ -28,32 +31,36 @@ import (
 const (
 	targetBlockSize        = 4096
 	footerSize             = 48
-	magic           uint64 = 0x31564b5245424d45 // "EMBERKV1" little-endian
+	magic           uint64 = 0x32564b5245424d45 // "EMBERKV2" little-endian; v2 added versions
 )
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 type indexEntry struct {
-	firstKey []byte
-	offset   uint64
-	length   uint64
+	firstKey     []byte
+	firstVersion uint64
+	offset       uint64
+	length       uint64
 }
 
-// Writer builds an SSTable from entries added in strictly increasing key order.
+// Writer builds an SSTable from entries added in strictly increasing
+// (key ascending, version descending) order.
 type Writer struct {
 	f          *os.File
 	bw         *bufio.Writer
 	path       string
 	bitsPerKey int
 
-	offset     uint64
-	block      []byte
-	blockFirst []byte
-	index      []indexEntry
-	hashes     []uint64
-	lastKey    []byte
-	count      uint64
-	err        error
+	offset      uint64
+	block       []byte
+	blockFirst  []byte
+	blockFirstV uint64
+	index       []indexEntry
+	hashes      []uint64
+	lastKey     []byte
+	lastVersion uint64
+	count       uint64
+	err         error
 }
 
 // Create starts a new table at path.
@@ -68,21 +75,25 @@ func Create(path string, bitsPerKey int) (*Writer, error) {
 // Count returns the number of entries added so far.
 func (w *Writer) Count() uint64 { return w.count }
 
-// Add appends an entry. Keys must be strictly increasing.
+// Add appends an entry. (key, version) pairs must be strictly increasing in
+// entry order.
 func (w *Writer) Add(e *base.Entry) error {
 	if w.err != nil {
 		return w.err
 	}
-	if w.count > 0 && bytes.Compare(e.Key, w.lastKey) <= 0 {
-		w.err = fmt.Errorf("sstable: key %q added out of order", e.Key)
+	newKey := w.count == 0 || !bytes.Equal(e.Key, w.lastKey)
+	if w.count > 0 && base.Compare(e.Key, e.Version, w.lastKey, w.lastVersion) <= 0 {
+		w.err = fmt.Errorf("sstable: key %q version %d added out of order", e.Key, e.Version)
 		return w.err
 	}
 	if len(w.block) == 0 {
-		w.blockFirst = bytes.Clone(e.Key)
+		w.blockFirst, w.blockFirstV = bytes.Clone(e.Key), e.Version
 	}
 	w.block = base.AppendEntry(w.block, e)
-	w.lastKey = append(w.lastKey[:0], e.Key...)
-	w.hashes = append(w.hashes, bloom.Hash(e.Key))
+	if newKey {
+		w.hashes = append(w.hashes, bloom.Hash(e.Key))
+	}
+	w.lastKey, w.lastVersion = append(w.lastKey[:0], e.Key...), e.Version
 	w.count++
 	if len(w.block) >= targetBlockSize {
 		return w.flushBlock()
@@ -103,7 +114,8 @@ func (w *Writer) flushBlock() error {
 		return w.err
 	}
 	w.block = binary.LittleEndian.AppendUint32(w.block, crc32.Checksum(w.block, crcTable))
-	w.index = append(w.index, indexEntry{firstKey: w.blockFirst, offset: w.offset, length: uint64(len(w.block))})
+	w.index = append(w.index, indexEntry{firstKey: w.blockFirst, firstVersion: w.blockFirstV,
+		offset: w.offset, length: uint64(len(w.block))})
 	w.write(w.block)
 	w.block = w.block[:0]
 	return w.err
@@ -119,6 +131,7 @@ func (w *Writer) Finish() error {
 	for _, ie := range w.index {
 		idx = binary.AppendUvarint(idx, uint64(len(ie.firstKey)))
 		idx = append(idx, ie.firstKey...)
+		idx = binary.AppendUvarint(idx, ie.firstVersion)
 		idx = binary.AppendUvarint(idx, ie.offset)
 		idx = binary.AppendUvarint(idx, ie.length)
 	}
@@ -262,12 +275,13 @@ func decodeIndex(b []byte) ([]indexEntry, error) {
 		}
 		key := b[off : off+int(kl)]
 		off += int(kl)
+		ver, ok0 := next()
 		bo, ok1 := next()
 		bl, ok2 := next()
-		if !ok1 || !ok2 || bl < 4 {
+		if !ok0 || !ok1 || !ok2 || bl < 4 {
 			return nil, base.ErrCorrupt
 		}
-		index = append(index, indexEntry{firstKey: key, offset: bo, length: bl})
+		index = append(index, indexEntry{firstKey: key, firstVersion: ver, offset: bo, length: bl})
 	}
 	return index, nil
 }
@@ -288,11 +302,11 @@ func (r *Reader) Size() int64 { return r.size }
 // Close closes the underlying file.
 func (r *Reader) Close() error { return r.f.Close() }
 
-// findBlock returns the index of the last block whose first key is <= key,
-// or -1 if key sorts before every block.
-func (r *Reader) findBlock(key []byte) int {
+// findBlock returns the index of the last block whose first entry is at or
+// before (key, version) in entry order, or -1 if every block starts after it.
+func (r *Reader) findBlock(key []byte, version uint64) int {
 	i := sort.Search(len(r.index), func(i int) bool {
-		return bytes.Compare(r.index[i].firstKey, key) > 0
+		return base.Compare(r.index[i].firstKey, r.index[i].firstVersion, key, version) > 0
 	})
 	return i - 1
 }
@@ -328,52 +342,49 @@ func (r *Reader) readBlockFromFile(i int) ([]byte, error) {
 	return body, nil
 }
 
-// Get returns the entry for key, including tombstones.
-func (r *Reader) Get(key []byte) (base.Entry, bool, error) {
+// Get returns the newest entry for key with a version <= asOf, including
+// tombstones.
+func (r *Reader) Get(key []byte, asOf uint64) (base.Entry, bool, error) {
 	if !r.filter.MayContain(key) {
 		return base.Entry{}, false, nil
 	}
-	bi := r.findBlock(key)
-	if bi < 0 {
-		return base.Entry{}, false, nil
+	it := r.seek(key, asOf, true)
+	if !it.Next() {
+		return base.Entry{}, false, it.Err()
 	}
-	block, err := r.readBlock(bi, true)
-	if err != nil {
-		return base.Entry{}, false, err
-	}
-	for off := 0; off < len(block); {
-		e, n, err := base.DecodeEntry(block[off:])
-		if err != nil {
-			return base.Entry{}, false, err
-		}
-		switch c := bytes.Compare(e.Key, key); {
-		case c == 0:
-			return e, true, nil
-		case c > 0:
-			return base.Entry{}, false, nil
-		}
-		off += n
+	if e := it.Entry(); bytes.Equal(e.Key, key) {
+		return *e, true, nil
 	}
 	return base.Entry{}, false, nil
 }
 
-// Iterator returns an iterator over entries with key >= start (nil means all).
+// Iterator returns an iterator over every version of every key >= start (nil
+// means all), in entry order.
 func (r *Reader) Iterator(start []byte) base.Iterator {
-	bi := 0
-	if start != nil {
-		bi = max(r.findBlock(start), 0)
+	if start == nil {
+		return &iterator{r: r, bi: -1}
 	}
-	return &iterator{r: r, bi: bi - 1, start: start}
+	return r.seek(start, base.MaxVersion, false)
+}
+
+// seek returns an iterator positioned before the first entry at or after
+// (key, version). fill says whether blocks it reads go into the cache.
+func (r *Reader) seek(key []byte, version uint64, fill bool) *iterator {
+	bi := max(r.findBlock(key, version), 0)
+	return &iterator{r: r, bi: bi - 1, seekKey: key, seekVersion: version, seeking: true, fill: fill}
 }
 
 type iterator struct {
-	r     *Reader
-	bi    int
-	block []byte
-	off   int
-	start []byte
-	cur   base.Entry
-	err   error
+	r           *Reader
+	bi          int
+	block       []byte
+	off         int
+	seeking     bool
+	seekKey     []byte
+	seekVersion uint64
+	fill        bool
+	cur         base.Entry
+	err         error
 }
 
 func (it *iterator) Next() bool {
@@ -383,7 +394,7 @@ func (it *iterator) Next() bool {
 			if it.bi >= len(it.r.index) {
 				return false
 			}
-			it.block, it.err = it.r.readBlock(it.bi, false)
+			it.block, it.err = it.r.readBlock(it.bi, it.fill)
 			it.off = 0
 			continue
 		}
@@ -393,11 +404,11 @@ func (it *iterator) Next() bool {
 			return false
 		}
 		it.off += n
-		if it.start != nil {
-			if bytes.Compare(e.Key, it.start) < 0 {
+		if it.seeking {
+			if base.Compare(e.Key, e.Version, it.seekKey, it.seekVersion) < 0 {
 				continue
 			}
-			it.start = nil
+			it.seeking = false
 		}
 		it.cur = e
 		return true

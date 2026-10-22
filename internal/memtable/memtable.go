@@ -1,5 +1,6 @@
 // Package memtable is the in-memory, sorted write buffer of the LSM tree,
-// implemented as a skip list.
+// implemented as a skip list. It keeps every version of a key, ordered by
+// key ascending and version descending.
 package memtable
 
 import (
@@ -16,7 +17,7 @@ type node struct {
 	next  []*node
 }
 
-// Memtable is a concurrency-safe sorted map from key to its latest entry.
+// Memtable is a concurrency-safe sorted set of versioned entries.
 type Memtable struct {
 	mu     sync.RWMutex
 	head   *node
@@ -50,12 +51,13 @@ func (m *Memtable) randomHeight() int {
 	return h
 }
 
-// findGE returns the first node with key >= key. If prev is non-nil it is
-// filled with the rightmost node before that position on every level.
-func (m *Memtable) findGE(key []byte, prev []*node) *node {
+// findGE returns the first node at or after (key, version) in entry order.
+// If prev is non-nil it is filled with the rightmost node before that
+// position on every level.
+func (m *Memtable) findGE(key []byte, version uint64, prev []*node) *node {
 	x := m.head
 	for lvl := m.height - 1; lvl >= 0; lvl-- {
-		for nx := x.next[lvl]; nx != nil && bytes.Compare(nx.entry.Key, key) < 0; nx = x.next[lvl] {
+		for nx := x.next[lvl]; nx != nil && base.Compare(nx.entry.Key, nx.entry.Version, key, version) < 0; nx = x.next[lvl] {
 			x = nx
 		}
 		if prev != nil {
@@ -65,7 +67,9 @@ func (m *Memtable) findGE(key []byte, prev []*node) *node {
 	return x.next[0]
 }
 
-// Put inserts or replaces the entry for e.Key. Key and Value are copied.
+// Put inserts e. An entry with the same key and version is replaced, which
+// makes the last of several writes to one key in a batch win. Key and Value
+// are copied.
 func (m *Memtable) Put(e base.Entry) {
 	e.Key = bytes.Clone(e.Key)
 	e.Value = bytes.Clone(e.Value)
@@ -77,8 +81,8 @@ func (m *Memtable) Put(e base.Entry) {
 	defer m.mu.Unlock()
 
 	var prev [maxHeight]*node
-	n := m.findGE(e.Key, prev[:])
-	if n != nil && bytes.Equal(n.entry.Key, e.Key) {
+	n := m.findGE(e.Key, e.Version, prev[:])
+	if n != nil && n.entry.Version == e.Version && bytes.Equal(n.entry.Key, e.Key) {
 		m.size += e.Size() - n.entry.Size()
 		n.entry = e
 		return
@@ -100,11 +104,12 @@ func (m *Memtable) Put(e base.Entry) {
 	m.count++
 }
 
-// Get returns the entry stored for key, including tombstones.
-func (m *Memtable) Get(key []byte) (base.Entry, bool) {
+// Get returns the newest entry for key with a version <= asOf, including
+// tombstones.
+func (m *Memtable) Get(key []byte, asOf uint64) (base.Entry, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	n := m.findGE(key, nil)
+	n := m.findGE(key, asOf, nil)
 	if n != nil && bytes.Equal(n.entry.Key, key) {
 		return n.entry, true
 	}
@@ -118,20 +123,20 @@ func (m *Memtable) Size() int {
 	return m.size
 }
 
-// Len returns the number of distinct keys held.
+// Len returns the number of entries (versions) held.
 func (m *Memtable) Len() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.count
 }
 
-// Iterator returns an iterator over a point-in-time snapshot of all entries
-// with key >= start (nil means from the beginning).
+// Iterator returns an iterator over a point-in-time snapshot of every
+// version of every key >= start (nil means from the beginning).
 func (m *Memtable) Iterator(start []byte) base.Iterator {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	var entries []base.Entry
-	for n := m.findGE(start, nil); n != nil; n = n.next[0] {
+	for n := m.findGE(start, base.MaxVersion, nil); n != nil; n = n.next[0] {
 		entries = append(entries, n.entry)
 	}
 	return base.NewSliceIterator(entries)

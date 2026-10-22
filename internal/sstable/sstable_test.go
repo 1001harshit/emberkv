@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/1001harshit/emberkv/internal/base"
@@ -46,7 +47,7 @@ func TestGet(t *testing.T) {
 		t.Fatalf("Count = %d", r.Count())
 	}
 	for i := 0; i < n; i++ {
-		e, ok, err := r.Get(key(i * 2))
+		e, ok, err := r.Get(key(i*2), base.MaxVersion)
 		if err != nil || !ok {
 			t.Fatalf("Get(%s) = %v, %v", key(i*2), ok, err)
 		}
@@ -58,11 +59,11 @@ func TestGet(t *testing.T) {
 			t.Fatalf("Get(%s) = %q", key(i*2), e.Value)
 		}
 		// Odd keys fall between stored keys and must be absent.
-		if _, ok, _ := r.Get(key(i*2 + 1)); ok {
+		if _, ok, _ := r.Get(key(i*2+1), base.MaxVersion); ok {
 			t.Fatalf("found absent key %s", key(i*2+1))
 		}
 	}
-	if _, ok, _ := r.Get([]byte("a")); ok {
+	if _, ok, _ := r.Get([]byte("a"), base.MaxVersion); ok {
 		t.Fatal("found key before first block")
 	}
 }
@@ -144,7 +145,7 @@ func TestBlockCache(t *testing.T) {
 
 	for round := 0; round < 2; round++ {
 		for i := 0; i < 5000; i += 50 {
-			if _, ok, err := r.Get(key(i * 2)); err != nil || !ok {
+			if _, ok, err := r.Get(key(i*2), base.MaxVersion); err != nil || !ok {
 				t.Fatalf("Get(%s) = %v, %v", key(i*2), ok, err)
 			}
 		}
@@ -161,5 +162,72 @@ func TestBlockCache(t *testing.T) {
 	}
 	if _, _, size := c2.Stats(); size != 0 {
 		t.Fatalf("a full scan cached %d bytes", size)
+	}
+}
+
+// TestVersions writes many versions per key, enough that one key's versions
+// span several blocks, and reads at different points in time.
+func TestVersions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "000002.sst")
+	w, err := Create(path, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const keys, versions = 50, 100
+	big := make([]byte, 200)
+	for k := 0; k < keys; k++ {
+		for v := versions; v >= 1; v-- { // newest first, as tables store them
+			e := base.Entry{Key: key(k), Value: append([]byte(fmt.Sprintf("%d:%d:", k, v)), big...),
+				Kind: base.KindSet, Version: uint64(v * 10)}
+			if err := w.Add(&e); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := w.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if len(r.index) < keys*2 {
+		t.Fatalf("only %d blocks; versions should span blocks", len(r.index))
+	}
+	for k := 0; k < keys; k++ {
+		for _, asOf := range []uint64{5, 10, 15, 500, 555, 1000, base.MaxVersion} {
+			e, ok, err := r.Get(key(k), asOf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := int(min(asOf, 1000) / 10)
+			if want == 0 {
+				if ok {
+					t.Fatalf("Get(%d, %d) found version %d before the first write", k, asOf, e.Version)
+				}
+				continue
+			}
+			if !ok || e.Version != uint64(want*10) || !strings.HasPrefix(string(e.Value), fmt.Sprintf("%d:%d:", k, want)) {
+				t.Fatalf("Get(%d, %d) = version %d, %v; want version %d", k, asOf, e.Version, ok, want*10)
+			}
+		}
+	}
+	// A key whose versions are all newer than asOf is not visible, even
+	// though older keys exist in the table.
+	if _, ok, _ := r.Get(key(keys), base.MaxVersion); ok {
+		t.Fatal("found a key that was never written")
+	}
+}
+
+func TestVersionOrderEnforced(t *testing.T) {
+	w, err := Create(filepath.Join(t.TempDir(), "x.sst"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Abort()
+	w.Add(&base.Entry{Key: []byte("a"), Kind: base.KindSet, Version: 5})
+	if err := w.Add(&base.Entry{Key: []byte("a"), Kind: base.KindSet, Version: 9}); err == nil {
+		t.Fatal("older-first versions accepted")
 	}
 }
