@@ -176,7 +176,7 @@ func (s *Server) dispatch(w *resp.Writer, args [][]byte) (quit bool) {
 	name := strings.ToLower(string(args[0]))
 	cmd, ok := commands[name]
 	if !ok {
-		w.WriteError("ERR unknown command '" + truncate(string(args[0]), 64) + "'")
+		w.WriteError(unknownCommandError(args))
 		return false
 	}
 	if (cmd.arity > 0 && len(args) != cmd.arity) || (cmd.arity < 0 && len(args) < -cmd.arity) {
@@ -188,11 +188,21 @@ func (s *Server) dispatch(w *resp.Writer, args [][]byte) (quit bool) {
 	return c.quit
 }
 
-func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "..."
+// unknownCommandError formats the error exactly as Redis does, since some
+// clients match on it: the name is cut at 128 bytes, and the quoted
+// arguments are listed until they reach 128 bytes.
+func unknownCommandError(args [][]byte) string {
+	var list []byte
+	for _, a := range args[1:] {
+		if len(list) >= 128 {
+			break
+		}
+		list = append(list, '\'')
+		list = append(list, a[:min(len(a), 128-len(list)+1)]...)
+		list = append(list, '\'', ' ')
 	}
-	return s
+	name := args[0][:min(len(args[0]), 128)]
+	return "ERR unknown command '" + string(name) + "', with args beginning with: " + string(list)
 }
 
 // cursorTable maps the integer cursors SCAN hands to clients onto the key the

@@ -146,7 +146,8 @@ func TestSetOptions(t *testing.T) {
 	c.expectErr("ERR invalid expire time", "SET", "k", "v", "EX", "0")
 	c.expectErr("ERR value is not an integer", "SET", "k", "v", "EX", "soon")
 	c.expectErr("ERR wrong number of arguments", "SET", "k")
-	c.expectErr("ERR unknown command", "FROBNICATE")
+	c.expect(resp.Error("ERR unknown command 'FROBNICATE', with args beginning with: "), "FROBNICATE")
+	c.expect(resp.Error("ERR unknown command 'frob', with args beginning with: 'a' 'b c' "), "frob", "a", "b c")
 }
 
 func TestCounters(t *testing.T) {
