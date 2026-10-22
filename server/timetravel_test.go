@@ -70,3 +70,37 @@ func TestAsOfAndHistory(t *testing.T) {
 		t.Fatalf("INFO storage missing history fields:\n%s", info)
 	}
 }
+
+func TestRollbackUndoesFlush(t *testing.T) {
+	var ns atomic.Int64
+	ns.Store(time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC).UnixNano())
+	now := func() time.Time { return time.Unix(0, ns.Load()) }
+	tick := func(d time.Duration) time.Time { ns.Add(int64(d)); return now() }
+
+	_, addr := startServer(t, lsm.Options{Now: now, History: time.Hour})
+	c := dial(t, addr)
+	c.do("SET", "greeting", "hello", "EX", "500")
+	c.do("HSET", "user:1", "name", "ada", "lang", "go")
+	c.do("SADD", "tags", "a", "b")
+	c.do("INCR", "visits")
+	good := tick(time.Second)
+	tick(time.Second)
+	c.do("FLUSHDB")
+	c.do("SET", "new-after-flush", "x")
+	tick(time.Second)
+
+	c.expect(int64(5), "ROLLBACK", fmt.Sprint(good.UnixMilli()))
+	c.expect("hello", "GET", "greeting")
+	c.expect(int64(497), "TTL", "greeting") // the expiry came back too
+	c.expect(list("lang", "go", "name", "ada"), "HGETALL", "user:1")
+	c.expect(list("a", "b"), "SMEMBERS", "tags")
+	c.expect("1", "GET", "visits")
+	c.expect(int64(0), "EXISTS", "new-after-flush")
+	c.expect(int64(4), "DBSIZE")
+
+	// Undo the rollback.
+	tick(time.Second)
+	c.expect(int64(5), "ROLLBACK", "-1500ms")
+	c.expect(list("new-after-flush"), "KEYS", "*")
+	c.expectErr("ERR time is older than the history window", "ROLLBACK", "-3h")
+}

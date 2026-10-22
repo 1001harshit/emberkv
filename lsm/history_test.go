@@ -200,3 +200,67 @@ func TestRefusesOlderFormat(t *testing.T) {
 		t.Fatalf("Open of a format-1 directory = %v, want a format error", err)
 	}
 }
+
+func TestRollbackTo(t *testing.T) {
+	clock := newFakeClock()
+	dir := t.TempDir()
+	db := mustOpen(t, dir, historyOpts(clock, 24*time.Hour))
+	defer db.Close()
+
+	rnd := rand.New(rand.NewSource(3))
+	model := map[string]string{}
+	write := func(n int) {
+		for i := 0; i < n; i++ {
+			k := fmt.Sprintf("k%04d", rnd.Intn(2500)) // more keys than one rollback chunk
+			if rnd.Intn(3) == 0 {
+				db.Delete([]byte(k))
+				delete(model, k)
+			} else {
+				v := fmt.Sprintf("v%d", rnd.Int())
+				db.Put([]byte(k), []byte(v))
+				model[k] = v
+			}
+			clock.Advance(time.Millisecond)
+		}
+	}
+	write(4000)
+	clock.Advance(time.Second)
+	target := clock.Now()
+	snapshot := make(map[string]string, len(model))
+	for k, v := range model {
+		snapshot[k] = v
+	}
+	clock.Advance(time.Second)
+	write(4000)
+	db.PutTTL([]byte("ttl"), []byte("x"), time.Hour)
+	clock.Advance(time.Second)
+	beforeRollback := clock.Now()
+	current := make(map[string]string, len(model)+1)
+	for k, v := range model {
+		current[k] = v
+	}
+	current["ttl"] = "x"
+	clock.Advance(time.Second)
+
+	changed := 0
+	if err := db.RollbackTo(target, func([]byte) { changed++ }); err != nil {
+		t.Fatal(err)
+	}
+	if changed == 0 {
+		t.Fatal("rollback changed nothing")
+	}
+	checkMatchesModel(t, db, snapshot)
+
+	// The rollback is itself history: reading just before it shows the
+	// state it replaced, so it can be undone.
+	for k, want := range current {
+		if it, err := db.GetItemAt([]byte(k), beforeRollback); err != nil || string(it.Value) != want {
+			t.Fatalf("before rollback %s = %q, %v; want %q", k, it.Value, err, want)
+		}
+	}
+	clock.Advance(time.Second)
+	if err := db.RollbackTo(beforeRollback, nil); err != nil {
+		t.Fatal(err)
+	}
+	checkMatchesModel(t, db, current)
+}

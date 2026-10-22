@@ -334,6 +334,22 @@ func (s *Store) isGarbage(k []byte) bool {
 	return stale
 }
 
+// Rollback makes the whole keyspace equal to what it was at time at, and
+// returns the number of keys it changed. See lsm.DB.RollbackTo; like it, the
+// rollback is recorded in history and can be undone.
+func (s *Store) Rollback(at time.Time) (int, error) {
+	if !s.at.IsZero() {
+		return 0, ErrReadOnly
+	}
+	n := 0
+	err := s.db.RollbackTo(at, func(k []byte) {
+		if len(k) > 0 && k[0] == metaPrefix {
+			n++
+		}
+	})
+	return n, err
+}
+
 // Change is one past version of a key, as reported by History.
 type Change struct {
 	At    time.Time

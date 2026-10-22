@@ -77,6 +77,7 @@ func init() {
 		"compact":   {cmdCompact, 1},
 		"asof":      {cmdAsOf, -3},
 		"history":   {cmdHistory, -2},
+		"rollback":  {cmdRollback, 2},
 		"info":      {cmdInfo, -1},
 		"time":      {cmdTime, 1},
 		"command":   {cmdCommand, -1},

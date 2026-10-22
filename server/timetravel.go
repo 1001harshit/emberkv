@@ -121,3 +121,19 @@ func cmdHistory(c *ctx) {
 		}
 	}
 }
+
+// cmdRollback is an emberkv extension: ROLLBACK <time> makes the whole
+// database what it was at <time> and replies with the number of keys it
+// changed. It is recorded in history, so it can itself be rolled back.
+func cmdRollback(c *ctx) {
+	at, ok := c.parseTimeArg(c.args[1])
+	if !ok {
+		return
+	}
+	n, err := c.store().Rollback(at)
+	if err != nil {
+		c.fail(err)
+		return
+	}
+	c.w.WriteInt(int64(n))
+}
