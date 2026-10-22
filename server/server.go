@@ -145,6 +145,12 @@ func (s *Server) handle(conn net.Conn) {
 
 	r := resp.NewReader(conn)
 	w := resp.NewWriter(conn)
+	// Writes made by this connection are collected in pending instead of
+	// each waiting for the disk. Before replies are sent, one wait makes the
+	// whole batch durable, so a pipeline of N writes costs one log write
+	// while no reply ever reports a write that could still be lost.
+	var pending keyspace.Pending
+	st := s.st.Session(&pending)
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
@@ -158,10 +164,16 @@ func (s *Server) handle(conn net.Conn) {
 			continue
 		}
 		s.totalCmds.Add(1)
-		quit := s.dispatch(w, args)
-		// Flush only when no pipelined commands are waiting, so a pipeline of
-		// N commands costs one write instead of N.
+		quit := s.dispatch(st, w, args)
+		// Reply only when no pipelined commands are waiting, so a pipeline of
+		// N commands costs one log write and one network write instead of N.
 		if quit || r.Buffered() == 0 {
+			if err := pending.Wait(); err != nil {
+				// The writes may not be durable: drop the connection rather
+				// than send replies that claim they are.
+				s.logger.Printf("closing connection: %v", err)
+				return
+			}
 			if err := w.Flush(); err != nil {
 				return
 			}
@@ -172,7 +184,7 @@ func (s *Server) handle(conn net.Conn) {
 	}
 }
 
-func (s *Server) dispatch(w *resp.Writer, args [][]byte) (quit bool) {
+func (s *Server) dispatch(st *keyspace.Store, w *resp.Writer, args [][]byte) (quit bool) {
 	name := strings.ToLower(string(args[0]))
 	cmd, ok := commands[name]
 	if !ok {
@@ -183,7 +195,7 @@ func (s *Server) dispatch(w *resp.Writer, args [][]byte) (quit bool) {
 		w.WriteError("ERR wrong number of arguments for '" + name + "' command")
 		return false
 	}
-	c := &ctx{s: s, w: w, args: args}
+	c := &ctx{s: s, st: st, w: w, args: args}
 	cmd.fn(c)
 	return c.quit
 }

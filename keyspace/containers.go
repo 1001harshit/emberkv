@@ -136,7 +136,7 @@ func (s *Store) size(key []byte, typ Type) (int64, error) {
 // With nx, existing fields are left alone (HSETNX).
 func (s *Store) HSet(key []byte, pairs [][]byte, nx bool) (int64, error) {
 	var added int64
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		c, err := s.openContainer(tx, key, TypeHash, true)
 		if err != nil {
 			return err
@@ -189,7 +189,7 @@ func (s *Store) HGetAll(key []byte, fn func(field, value []byte)) error {
 // HIncrBy adds delta to the integer in field, creating it if needed.
 func (s *Store) HIncrBy(key, field []byte, delta int64) (int64, error) {
 	var result int64
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		c, err := s.openContainer(tx, key, TypeHash, true)
 		if err != nil {
 			return err
@@ -222,7 +222,7 @@ func (s *Store) HIncrBy(key, field []byte, delta int64) (int64, error) {
 // SAdd adds members and returns how many were new.
 func (s *Store) SAdd(key []byte, members [][]byte) (int64, error) {
 	var added int64
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		c, err := s.openContainer(tx, key, TypeSet, true)
 		if err != nil {
 			return err
@@ -269,7 +269,7 @@ func (s *Store) SMembers(key []byte) ([][]byte, error) {
 
 func (s *Store) removeMembers(key []byte, typ Type, fields [][]byte) (int64, error) {
 	var removed int64
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		c, err := s.openContainer(tx, key, typ, false)
 		if err != nil || c == nil {
 			return err

@@ -17,6 +17,7 @@ import (
 
 type ctx struct {
 	s    *Server
+	st   *keyspace.Store // this connection's session
 	w    *resp.Writer
 	args [][]byte
 	quit bool
@@ -91,9 +92,9 @@ const (
 	errOverflow   = replyErr("ERR increment or decrement would overflow")
 )
 
-func (c *ctx) st() *keyspace.Store { return c.s.st }
-func (c *ctx) db() *lsm.DB         { return c.s.st.DB() }
-func (c *ctx) nowMs() int64        { return c.db().Now().UnixMilli() }
+func (c *ctx) store() *keyspace.Store { return c.st }
+func (c *ctx) db() *lsm.DB            { return c.st.DB() }
+func (c *ctx) nowMs() int64           { return c.db().Now().UnixMilli() }
 
 func (c *ctx) fail(err error) {
 	var re replyErr
@@ -132,7 +133,7 @@ func parseInt(b []byte) (int64, error) {
 // get returns the string at key, or nil if it does not exist. It fails with
 // keyspace.ErrWrongType if the key holds another type.
 func (c *ctx) get(key []byte) (*lsm.Item, error) {
-	return c.st().Get(key)
+	return c.store().Get(key)
 }
 
 // ---- connection ----
@@ -240,7 +241,7 @@ func cmdSet(c *ctx) {
 	}
 	if !nx && !xx && !get && !keepTTL {
 		// A plain SET overwrites any type, so it needs no read: a blind write.
-		if err := c.st().SetEx(key, val, exp); err != nil {
+		if err := c.store().SetEx(key, val, exp); err != nil {
 			c.fail(err)
 			return
 		}
@@ -250,7 +251,7 @@ func cmdSet(c *ctx) {
 
 	var old *lsm.Item
 	wrote := false
-	err := c.st().SetUpdate(key, func(cur *lsm.Item, other bool) (*lsm.Item, bool, error) {
+	err := c.store().SetUpdate(key, func(cur *lsm.Item, other bool) (*lsm.Item, bool, error) {
 		// SET overwrites a key of any type, but SET ... GET needs a string.
 		if other && get {
 			return nil, false, keyspace.ErrWrongType
@@ -281,7 +282,7 @@ func cmdSet(c *ctx) {
 
 func cmdSetNX(c *ctx) {
 	var wrote int64
-	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.store().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		if cur != nil {
 			return nil, false, nil
 		}
@@ -307,7 +308,7 @@ func cmdSetEx(unit time.Duration) func(*ctx) {
 			c.w.WriteError("ERR invalid expire time in '" + strings.ToLower(string(c.args[0])) + "' command")
 			return
 		}
-		if err := c.st().SetEx(c.args[1], c.args[3], exp); err != nil {
+		if err := c.store().SetEx(c.args[1], c.args[3], exp); err != nil {
 			c.fail(err)
 			return
 		}
@@ -317,7 +318,7 @@ func cmdSetEx(unit time.Duration) func(*ctx) {
 
 func cmdGetSet(c *ctx) {
 	var old *lsm.Item
-	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.store().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		old = cur
 		return &lsm.Item{Value: c.args[2]}, true, nil
 	})
@@ -330,7 +331,7 @@ func cmdGetSet(c *ctx) {
 
 func cmdGetDel(c *ctx) {
 	var old *lsm.Item
-	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.store().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		old = cur
 		return nil, cur != nil, nil
 	})
@@ -344,7 +345,7 @@ func cmdGetDel(c *ctx) {
 func cmdDel(c *ctx) {
 	var n int64
 	for _, key := range c.args[1:] {
-		existed, err := c.st().Delete(key)
+		existed, err := c.store().Delete(key)
 		if err != nil {
 			c.fail(err)
 			return
@@ -359,7 +360,7 @@ func cmdDel(c *ctx) {
 func cmdExists(c *ctx) {
 	var n int64
 	for _, key := range c.args[1:] {
-		ok, err := c.st().Exists(key)
+		ok, err := c.store().Exists(key)
 		if err != nil {
 			c.fail(err)
 			return
@@ -373,7 +374,7 @@ func cmdExists(c *ctx) {
 
 func (c *ctx) incrBy(key []byte, delta int64) {
 	var result int64
-	err := c.st().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.store().Update(key, func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		var n, exp int64
 		if cur != nil {
 			v, err := parseInt(cur.Value)
@@ -419,7 +420,7 @@ func cmdIncrBy(sign int64) func(*ctx) {
 
 func cmdAppend(c *ctx) {
 	var length int
-	err := c.st().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
+	err := c.store().Update(c.args[1], func(cur *lsm.Item) (*lsm.Item, bool, error) {
 		next := &lsm.Item{}
 		if cur != nil {
 			next.Value = append(append([]byte{}, cur.Value...), c.args[2]...)
@@ -474,7 +475,7 @@ func cmdMSet(c *ctx) {
 		c.w.WriteError("ERR wrong number of arguments for 'mset' command")
 		return
 	}
-	if err := c.st().MSet(c.args[1:]); err != nil {
+	if err := c.store().MSet(c.args[1:]); err != nil {
 		c.fail(err)
 		return
 	}
@@ -497,7 +498,7 @@ func cmdExpire(unit time.Duration, absolute bool) func(*ctx) {
 			return
 		}
 		// UpdateExpiry deletes the key when the deadline is not in the future.
-		existed, err := c.st().UpdateExpiry(c.args[1], func(int64) (int64, bool) {
+		existed, err := c.store().UpdateExpiry(c.args[1], func(int64) (int64, bool) {
 			return max(exp, 1), true
 		})
 		if err != nil {
@@ -510,7 +511,7 @@ func cmdExpire(unit time.Duration, absolute bool) func(*ctx) {
 
 func cmdTTL(unit time.Duration) func(*ctx) {
 	return func(c *ctx) {
-		expireAt, exists, err := c.st().ExpireAt(c.args[1])
+		expireAt, exists, err := c.store().ExpireAt(c.args[1])
 		switch {
 		case err != nil:
 			c.fail(err)
@@ -531,7 +532,7 @@ func cmdTTL(unit time.Duration) func(*ctx) {
 
 func cmdPersist(c *ctx) {
 	changed := false
-	_, err := c.st().UpdateExpiry(c.args[1], func(expireAt int64) (int64, bool) {
+	_, err := c.store().UpdateExpiry(c.args[1], func(expireAt int64) (int64, bool) {
 		changed = expireAt != 0
 		return 0, changed
 	})
@@ -552,7 +553,7 @@ func boolInt(b bool) int64 {
 // ---- keyspace ----
 
 func cmdType(c *ctx) {
-	t, err := c.st().Type(c.args[1])
+	t, err := c.store().Type(c.args[1])
 	if err != nil {
 		c.fail(err)
 		return
@@ -563,7 +564,7 @@ func cmdType(c *ctx) {
 func cmdKeys(c *ctx) {
 	pattern := c.args[1]
 	var keys [][]byte
-	err := c.st().Scan(nil, func(key []byte, _ keyspace.Type) bool {
+	err := c.store().Scan(nil, func(key []byte, _ keyspace.Type) bool {
 		if globMatch(pattern, key) {
 			keys = append(keys, key)
 		}
@@ -630,7 +631,7 @@ func cmdScan(c *ctx) {
 	var next []byte
 	var page [][]byte
 	examined := 0
-	err = c.st().Scan(start, func(key []byte, t keyspace.Type) bool {
+	err = c.store().Scan(start, func(key []byte, t keyspace.Type) bool {
 		if examined == count {
 			next = key
 			return false
@@ -658,7 +659,7 @@ func cmdScan(c *ctx) {
 }
 
 func cmdDBSize(c *ctx) {
-	n, err := c.st().Count()
+	n, err := c.store().Count()
 	if err != nil {
 		c.fail(err)
 		return
@@ -671,7 +672,7 @@ func cmdFlushDB(c *ctx) {
 		c.fail(errSyntax)
 		return
 	}
-	if err := c.st().FlushAll(); err != nil {
+	if err := c.store().FlushAll(); err != nil {
 		c.fail(err)
 		return
 	}
@@ -782,7 +783,7 @@ func cmdInfo(c *ctx) {
 		line("")
 	}
 	if want("keyspace") {
-		n, err := c.st().Count()
+		n, err := c.store().Count()
 		if err != nil {
 			c.fail(err)
 			return

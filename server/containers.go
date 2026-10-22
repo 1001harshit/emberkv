@@ -47,7 +47,7 @@ func cmdHSet(nx, legacyOK bool) func(*ctx) {
 			c.w.WriteError("ERR wrong number of arguments for '" + string(bytes.ToLower(c.args[0])) + "' command")
 			return
 		}
-		added, err := c.st().HSet(c.args[1], pairs, nx)
+		added, err := c.store().HSet(c.args[1], pairs, nx)
 		switch {
 		case err != nil:
 			c.fail(err)
@@ -60,7 +60,7 @@ func cmdHSet(nx, legacyOK bool) func(*ctx) {
 }
 
 func cmdHGet(c *ctx) {
-	v, ok, err := c.st().HGet(c.args[1], c.args[2])
+	v, ok, err := c.store().HGet(c.args[1], c.args[2])
 	switch {
 	case err != nil:
 		c.fail(err)
@@ -75,7 +75,7 @@ func cmdHMGet(c *ctx) {
 	vals := make([][]byte, 0, len(c.args)-2)
 	found := make([]bool, 0, len(c.args)-2)
 	for _, f := range c.args[2:] {
-		v, ok, err := c.st().HGet(c.args[1], f)
+		v, ok, err := c.store().HGet(c.args[1], f)
 		if err != nil {
 			c.fail(err)
 			return
@@ -95,7 +95,7 @@ func cmdHMGet(c *ctx) {
 func cmdHGetAll(fields, values bool) func(*ctx) {
 	return func(c *ctx) {
 		var out [][]byte
-		err := c.st().HGetAll(c.args[1], func(f, v []byte) {
+		err := c.store().HGetAll(c.args[1], func(f, v []byte) {
 			if fields {
 				out = append(out, f)
 			}
@@ -112,7 +112,7 @@ func cmdHGetAll(fields, values bool) func(*ctx) {
 }
 
 func cmdHDel(c *ctx) {
-	n, err := c.st().HDel(c.args[1], c.args[2:])
+	n, err := c.store().HDel(c.args[1], c.args[2:])
 	if err != nil {
 		c.fail(err)
 		return
@@ -121,7 +121,7 @@ func cmdHDel(c *ctx) {
 }
 
 func cmdHLen(c *ctx) {
-	n, err := c.st().HLen(c.args[1])
+	n, err := c.store().HLen(c.args[1])
 	if err != nil {
 		c.fail(err)
 		return
@@ -130,7 +130,7 @@ func cmdHLen(c *ctx) {
 }
 
 func cmdHExists(c *ctx) {
-	_, ok, err := c.st().HGet(c.args[1], c.args[2])
+	_, ok, err := c.store().HGet(c.args[1], c.args[2])
 	if err != nil {
 		c.fail(err)
 		return
@@ -139,7 +139,7 @@ func cmdHExists(c *ctx) {
 }
 
 func cmdHStrlen(c *ctx) {
-	v, _, err := c.st().HGet(c.args[1], c.args[2])
+	v, _, err := c.store().HGet(c.args[1], c.args[2])
 	if err != nil {
 		c.fail(err)
 		return
@@ -153,7 +153,7 @@ func cmdHIncrBy(c *ctx) {
 		c.fail(err)
 		return
 	}
-	n, err := c.st().HIncrBy(c.args[1], c.args[2], delta)
+	n, err := c.store().HIncrBy(c.args[1], c.args[2], delta)
 	if err != nil {
 		c.fail(err)
 		return
@@ -164,7 +164,7 @@ func cmdHIncrBy(c *ctx) {
 // ---- sets ----
 
 func cmdSAdd(c *ctx) {
-	n, err := c.st().SAdd(c.args[1], c.args[2:])
+	n, err := c.store().SAdd(c.args[1], c.args[2:])
 	if err != nil {
 		c.fail(err)
 		return
@@ -173,7 +173,7 @@ func cmdSAdd(c *ctx) {
 }
 
 func cmdSRem(c *ctx) {
-	n, err := c.st().SRem(c.args[1], c.args[2:])
+	n, err := c.store().SRem(c.args[1], c.args[2:])
 	if err != nil {
 		c.fail(err)
 		return
@@ -182,7 +182,7 @@ func cmdSRem(c *ctx) {
 }
 
 func cmdSMembers(c *ctx) {
-	members, err := c.st().SMembers(c.args[1])
+	members, err := c.store().SMembers(c.args[1])
 	if err != nil {
 		c.fail(err)
 		return
@@ -191,7 +191,7 @@ func cmdSMembers(c *ctx) {
 }
 
 func cmdSIsMember(c *ctx) {
-	ok, err := c.st().SIsMember(c.args[1], c.args[2])
+	ok, err := c.store().SIsMember(c.args[1], c.args[2])
 	if err != nil {
 		c.fail(err)
 		return
@@ -202,7 +202,7 @@ func cmdSIsMember(c *ctx) {
 func cmdSMIsMember(c *ctx) {
 	res := make([]int64, 0, len(c.args)-2)
 	for _, m := range c.args[2:] {
-		ok, err := c.st().SIsMember(c.args[1], m)
+		ok, err := c.store().SIsMember(c.args[1], m)
 		if err != nil {
 			c.fail(err)
 			return
@@ -216,7 +216,7 @@ func cmdSMIsMember(c *ctx) {
 }
 
 func cmdSCard(c *ctx) {
-	n, err := c.st().SCard(c.args[1])
+	n, err := c.store().SCard(c.args[1])
 	if err != nil {
 		c.fail(err)
 		return
@@ -238,7 +238,7 @@ func cmdSetOp(op setOp) func(*ctx) {
 	return func(c *ctx) {
 		var result map[string]bool
 		for i, key := range c.args[1:] {
-			members, err := c.st().SMembers(key)
+			members, err := c.store().SMembers(key)
 			if err != nil {
 				c.fail(err)
 				return

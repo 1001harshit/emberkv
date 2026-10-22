@@ -383,7 +383,7 @@ func (db *DB) Write(b *Batch) error {
 	if err != nil {
 		return err
 	}
-	return c.wait()
+	return c.Wait()
 }
 
 // Update atomically reads key and replaces it with fn's result. fn receives
@@ -394,10 +394,10 @@ func (db *DB) Update(key []byte, fn func(cur *Item) (next *Item, write bool, err
 	if err != nil {
 		return err
 	}
-	return c.wait()
+	return c.Wait()
 }
 
-func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commit, error) {
+func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (Commit, error) {
 	defer db.locks.lock([][]byte{key})()
 
 	var cur *Item
@@ -406,17 +406,17 @@ func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commi
 	case err == nil:
 		cur = &item
 	case !errors.Is(err, ErrNotFound):
-		return commit{}, err
+		return Commit{}, err
 	}
 	next, write, err := fn(cur)
 	if err != nil || !write {
-		return commit{}, err
+		return Commit{}, err
 	}
 	e := base.Entry{Key: key, Kind: base.KindDelete}
 	if next != nil {
 		e = base.Entry{Key: key, Value: next.Value, Kind: base.KindSet, ExpireAt: next.ExpireAt}
 	} else if cur == nil {
-		return commit{}, nil // deleting a key that is already gone
+		return Commit{}, nil // deleting a key that is already gone
 	}
 	return db.apply([]base.Entry{e})
 }
@@ -480,29 +480,40 @@ func (db *DB) TxnKeys(lockKeys [][]byte, fn func(tx *Txn) error) error {
 	return db.txn(db.locks.lock(lockKeys), fn)
 }
 
+// TxnKeysNoWait is TxnKeys without waiting for durability: the writes are
+// applied and visible when it returns, and the caller must call Wait on the
+// result before telling anyone they are durable. A server can apply a whole
+// pipeline of commands and wait once, so they share one log write.
+func (db *DB) TxnKeysNoWait(lockKeys [][]byte, fn func(tx *Txn) error) (Commit, error) {
+	return db.txnNoWait(db.locks.lock(lockKeys), fn)
+}
+
 func (db *DB) txn(unlock func(), fn func(tx *Txn) error) error {
-	tx := &Txn{db: db}
-	err := fn(tx)
-	var c commit
-	if err == nil {
-		c, err = db.apply(tx.entries)
-	}
-	unlock()
+	c, err := db.txnNoWait(unlock, fn)
 	if err != nil {
 		return err
 	}
-	return c.wait()
+	return c.Wait()
 }
 
-// commit identifies a write that has been applied to the memtable but may
-// not yet be durable.
-type commit struct {
+func (db *DB) txnNoWait(unlock func(), fn func(tx *Txn) error) (Commit, error) {
+	defer unlock()
+	tx := &Txn{db: db}
+	if err := fn(tx); err != nil {
+		return Commit{}, err
+	}
+	return db.apply(tx.entries)
+}
+
+// Commit identifies a write that has been applied to the memtable but may
+// not yet be durable. The zero Commit is already durable.
+type Commit struct {
 	w   *wal.Writer
 	lsn uint64
 }
 
-// wait blocks until the write is durable according to the sync mode.
-func (c commit) wait() error {
+// Wait blocks until the write is durable according to the sync mode.
+func (c Commit) Wait() error {
 	if c.w == nil {
 		return nil
 	}
@@ -523,9 +534,9 @@ func (c commit) wait() error {
 // a write slightly before it is durable (as in Redis), but a client is only
 // acknowledged once its write is durable, and the log preserves order, so a
 // crash can only lose a suffix of unacknowledged writes.
-func (db *DB) apply(entries []base.Entry) (commit, error) {
+func (db *DB) apply(entries []base.Entry) (Commit, error) {
 	if len(entries) == 0 {
-		return commit{}, nil
+		return Commit{}, nil
 	}
 	db.appendMu.Lock()
 	defer db.appendMu.Unlock()
@@ -533,15 +544,15 @@ func (db *DB) apply(entries []base.Entry) (commit, error) {
 	closed, bgErr := db.closed, db.bgErr
 	db.mu.RUnlock()
 	if closed {
-		return commit{}, ErrClosed
+		return Commit{}, ErrClosed
 	}
 	if bgErr != nil {
-		return commit{}, bgErr
+		return Commit{}, bgErr
 	}
 	w := db.wal
 	lsn, err := w.Append(entries...)
 	if err != nil {
-		return commit{}, err
+		return Commit{}, err
 	}
 	for _, e := range entries {
 		db.mem.Put(e)
@@ -549,10 +560,10 @@ func (db *DB) apply(entries []base.Entry) (commit, error) {
 	if db.mem.Size() >= db.opts.MemtableSize {
 		// rotate closes w, which writes and fsyncs everything buffered in it.
 		if err := db.rotate(); err != nil {
-			return commit{}, err
+			return Commit{}, err
 		}
 	}
-	return commit{w: w, lsn: lsn}, nil
+	return Commit{w: w, lsn: lsn}, nil
 }
 
 // rotate freezes the current memtable and starts a new memtable and log.

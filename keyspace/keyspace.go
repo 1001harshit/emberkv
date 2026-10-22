@@ -159,9 +159,15 @@ func loadMeta(g getter, key []byte) (*meta, error) {
 // Store is a typed keyspace on top of an lsm.DB.
 type Store struct {
 	db      *lsm.DB
+	shared  *shared
+	pending *Pending // nil: each write waits for its own durability
+}
+
+// shared is the state every Session of a Store has in common.
+type shared struct {
 	version atomic.Uint64
 
-	// gcCache remembers the last container checked by the compaction filter;
+	// The compaction filter remembers the last container it checked;
 	// consecutive member records almost always belong to the same container.
 	gcMu    sync.Mutex
 	gcKey   []byte
@@ -169,10 +175,50 @@ type Store struct {
 	gcStale bool
 }
 
+// Pending collects writes that have been applied but may not be durable
+// yet. It belongs to one goroutine, typically one client connection.
+type Pending struct {
+	commits []lsm.Commit
+}
+
+// Wait blocks until every collected write is durable. Waiting on the first
+// usually makes the rest durable too, since one log write covers them all.
+func (p *Pending) Wait() error {
+	var first error
+	for _, c := range p.commits {
+		if err := c.Wait(); err != nil && first == nil {
+			first = err
+		}
+	}
+	p.commits = p.commits[:0]
+	return first
+}
+
+// Session returns a view of the Store whose writes do not wait for
+// durability but are collected in p instead; the caller must call p.Wait
+// before acknowledging them. Redis does the same with pipelines: it runs
+// every command it has read, writes the AOF once, then sends the replies.
+func (s *Store) Session(p *Pending) *Store {
+	return &Store{db: s.db, shared: s.shared, pending: p}
+}
+
+// txn runs a transaction locking keys, waiting for durability unless the
+// Store is a Session.
+func (s *Store) txn(keys [][]byte, fn func(*lsm.Txn) error) error {
+	if s.pending == nil {
+		return s.db.TxnKeys(keys, fn)
+	}
+	c, err := s.db.TxnKeysNoWait(keys, fn)
+	if err == nil {
+		s.pending.commits = append(s.pending.commits, c)
+	}
+	return err
+}
+
 // Open opens the database in dir with the keyspace's compaction filter
 // installed, so fields of deleted or overwritten containers are reclaimed.
 func Open(dir string, opts lsm.Options) (*Store, error) {
-	s := &Store{}
+	s := &Store{shared: &shared{}}
 	var ready atomic.Bool
 	opts.CompactionFilter = func(key []byte, _ lsm.Item) bool {
 		return ready.Load() && s.isGarbage(key)
@@ -196,9 +242,9 @@ func (s *Store) Close() error { return s.db.Close() }
 // nanoseconds, bumped if the clock has not moved past the previous one.
 func (s *Store) newVersion() uint64 {
 	for {
-		old := s.version.Load()
+		old := s.shared.version.Load()
 		v := max(uint64(time.Now().UnixNano()), old+1)
-		if s.version.CompareAndSwap(old, v) {
+		if s.shared.version.CompareAndSwap(old, v) {
 			return v
 		}
 	}
@@ -212,17 +258,17 @@ func (s *Store) isGarbage(k []byte) bool {
 	if !ok {
 		return false
 	}
-	s.gcMu.Lock()
-	defer s.gcMu.Unlock()
-	if s.gcKey != nil && bytes.Equal(s.gcKey, key) && s.gcVer == version {
-		return s.gcStale
+	s.shared.gcMu.Lock()
+	defer s.shared.gcMu.Unlock()
+	if s.shared.gcKey != nil && bytes.Equal(s.shared.gcKey, key) && s.shared.gcVer == version {
+		return s.shared.gcStale
 	}
 	m, err := loadMeta(s.db, key)
 	if err != nil {
 		return false // when in doubt, keep
 	}
 	stale := m == nil || (m.typ != TypeHash && m.typ != TypeSet) || m.version != version
-	s.gcKey, s.gcVer, s.gcStale = bytes.Clone(key), version, stale
+	s.shared.gcKey, s.shared.gcVer, s.shared.gcStale = bytes.Clone(key), version, stale
 	return stale
 }
 
@@ -247,7 +293,7 @@ func (s *Store) Exists(key []byte) (bool, error) {
 // and sets this is a single write regardless of size.
 func (s *Store) Delete(key []byte) (bool, error) {
 	existed := false
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil || m == nil {
 			return err
@@ -273,7 +319,7 @@ func (s *Store) ExpireAt(key []byte) (int64, bool, error) {
 // at or before now deletes the key. It reports whether the key existed.
 func (s *Store) UpdateExpiry(key []byte, fn func(expireAt int64) (next int64, write bool)) (bool, error) {
 	existed := false
-	err := s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	err := s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil || m == nil {
 			return err
@@ -328,7 +374,7 @@ func (s *Store) FlushAll() error {
 	for len(keys) > 0 {
 		n := min(len(keys), 1000)
 		chunk := keys[:n]
-		if err := s.db.TxnKeys(chunk, func(tx *lsm.Txn) error {
+		if err := s.txn(chunk, func(tx *lsm.Txn) error {
 			for _, k := range chunk {
 				tx.Delete(metaKey(k))
 			}
@@ -370,7 +416,7 @@ func (s *Store) Update(key []byte, fn func(cur *lsm.Item) (next *lsm.Item, write
 // SetUpdate is Update for commands like SET that may overwrite a key of any
 // type: fn is told whether the key currently holds a non-string (other).
 func (s *Store) SetUpdate(key []byte, fn func(cur *lsm.Item, other bool) (next *lsm.Item, write bool, err error)) error {
-	return s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	return s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		m, err := loadMeta(txnGetter{tx}, key)
 		if err != nil {
 			return err
@@ -402,7 +448,7 @@ func (s *Store) MSet(pairs [][]byte) error {
 	for i := 0; i+1 < len(pairs); i += 2 {
 		keys = append(keys, pairs[i])
 	}
-	return s.db.TxnKeys(keys, func(tx *lsm.Txn) error {
+	return s.txn(keys, func(tx *lsm.Txn) error {
 		for i := 0; i+1 < len(pairs); i += 2 {
 			m := meta{typ: TypeString, value: pairs[i+1]}
 			tx.Set(metaKey(pairs[i]), m.encode(), 0)
@@ -415,7 +461,7 @@ func (s *Store) MSet(pairs [][]byte) error {
 // type. It is a blind write, but still takes the key's lock so it cannot land
 // between another operation's read and write of the same key.
 func (s *Store) SetEx(key, value []byte, expireAt int64) error {
-	return s.db.TxnKeys([][]byte{key}, func(tx *lsm.Txn) error {
+	return s.txn([][]byte{key}, func(tx *lsm.Txn) error {
 		m := meta{typ: TypeString, value: value}
 		tx.Set(metaKey(key), m.encode(), expireAt)
 		return nil

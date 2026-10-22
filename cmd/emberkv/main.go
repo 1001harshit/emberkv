@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"syscall"
 
 	"github.com/1001harshit/emberkv/internal/wal"
@@ -24,6 +25,7 @@ func main() {
 	trigger := flag.Int("compaction-trigger", 4, "number of SSTables before background compaction starts")
 	cacheMB := flag.Int("block-cache-mb", 64, "memory for caching SSTable blocks, in MiB (0 disables)")
 	version := flag.Bool("version", false, "print version and exit")
+	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile to this file until shutdown")
 	flag.Parse()
 
 	if *version {
@@ -32,6 +34,14 @@ func main() {
 	}
 
 	logger := log.New(os.Stderr, "emberkv ", log.LstdFlags)
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			logger.Fatal(err)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	mode, err := wal.ParseSyncMode(*fsync)
 	if err != nil {
 		logger.Fatal(err)
