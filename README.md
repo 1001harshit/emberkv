@@ -26,7 +26,7 @@ OK
 ## Features
 
 - **Redis protocol (RESP2)** with pipelining and inline commands. Verified with [`go-redis`](https://github.com/redis/go-redis), including pipelines, `SCAN` iterators and TTLs. Other RESP2 clients such as `redis-cli` and `redis-py` should work too, since they speak the same protocol, but they haven't been tested yet.
-- **Durable writes.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Torn writes from a crash are detected and discarded on recovery.
+- **Durable writes with group commit.** A CRC-checked write-ahead log with Redis-style fsync policies (`always`, `everysec`, `no`). Concurrent writers share one `write` and one `fsync`. Torn writes from a crash are detected and discarded on recovery.
 - **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives).
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
@@ -105,6 +105,8 @@ db.Scan([]byte("user:"), func(k []byte, it lsm.Item) bool {
 
 **Write path.** Every write, or batch of writes, becomes a single WAL record (`crc32c | length | entries`) and is then inserted into the skip list. When the memtable reaches its size limit it is frozen. A new memtable and WAL take over, and a background goroutine writes the frozen one out as an SSTable. Once the new table is listed in the `MANIFEST`, which is replaced atomically via write-temp-then-rename, the old WAL is deleted. If flushing falls behind, writers stall instead of letting memory grow without limit.
 
+**Group commit.** Writers hold the write lock only long enough to encode their record into an in-memory log buffer and apply it to the memtable. Then they release the lock and wait for durability. The first waiter becomes the *leader*: it writes everything buffered so far with a single `write(2)` (plus a single `fsync` under `-fsync always`) and wakes the others. Under load, dozens of writes share one syscall. This is the leader/follower scheme RocksDB uses, combined with "early lock release". A concurrent reader can see a write a moment before it is durable, as in Redis, but no client is acknowledged until its write is durable. The log also keeps writes in order, so a crash can only lose a suffix of unacknowledged writes. With 50 clients and `-fsync always`, this took `SET` from 365 to about 11,000 ops/s.
+
 **Read path.** Point lookups check the memtable, then frozen memtables, then each SSTable from newest to oldest, and stop at the first version found. A tombstone or an expired entry means "not found". Each SSTable keeps its index and Bloom filter in memory, so a lookup costs at most one 4 KiB block read per table that might contain the key. Scans run a k-way heap merge over all sources and keep only the newest version of each key.
 
 **Compaction.** Tables form one sequence from newest to oldest. The compactor only merges *contiguous* runs, so the merged table can take the run's place without breaking that order. It picks a run by these rules ([`compaction.go`](lsm/compaction.go)):
@@ -151,20 +153,25 @@ go test -race ./...
 
 ## Benchmarks
 
-`emberbench` is a small `redis-benchmark`-style load generator. It was run with 50 clients, 64-byte values, 100k keys and `-fsync everysec`, on an Apple M2 Pro:
+`emberbench` is a small `redis-benchmark`-style load generator. It was run with 50 clients, 64-byte values and 100k keys, on an Apple M2 Pro:
 
-| Test | Pipeline 1 | Pipeline 16 |
+| Test (`-fsync everysec`) | Pipeline 1 | Pipeline 16 |
 |---|---|---|
-| `SET` | ~63k ops/s (p50 0.98 ms) | ~115k ops/s |
-| `GET` | ~143k ops/s (p50 0.31 ms) | ~540k ops/s |
-| `INCR` | ~65k ops/s | |
-| 80/20 read/write | ~123k ops/s | |
+| `SET` | ~100k ops/s (p50 0.41 ms) | ~125k ops/s |
+| `GET` | ~141k ops/s (p50 0.33 ms) | ~695k ops/s |
+| `INCR` | ~105k ops/s | |
+| 80/20 read/write | ~118k ops/s | |
 
-Writes are serialized through one WAL, so group commit (see roadmap) is the obvious next step for write throughput.
+Effect of group commit on writes (pipeline 1):
+
+| | Before | After |
+|---|---|---|
+| `SET`, `-fsync everysec` | 65k ops/s, p50 0.98 ms | **100k ops/s**, p50 0.41 ms |
+| `SET`, `-fsync always` | 365 ops/s, p50 148 ms | **11k ops/s**, p50 4.3 ms (30×) |
 
 ## Roadmap
 
-- [ ] Group commit: batch concurrent writers into one WAL write and fsync
+- [x] Group commit: batch concurrent writers into one WAL write and fsync
 - [ ] Block cache for hot SSTable blocks
 - [ ] Hashes, lists and sets, encoded as composite keys over the same LSM
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan

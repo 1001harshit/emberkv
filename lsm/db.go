@@ -346,14 +346,26 @@ func (db *DB) Delete(key []byte) error {
 // none of them are recovered.
 func (db *DB) Write(b *Batch) error {
 	db.writeMu.Lock()
-	defer db.writeMu.Unlock()
-	return db.writeLocked(b.entries)
+	c, err := db.applyLocked(b.entries)
+	db.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.wait()
 }
 
 // Update atomically reads key and replaces it with fn's result. fn receives
 // nil if the key is absent or expired. If write is false nothing changes;
 // otherwise next is stored, or the key is deleted when next is nil.
 func (db *DB) Update(key []byte, fn func(cur *Item) (next *Item, write bool, err error)) error {
+	c, err := db.update(key, fn)
+	if err != nil {
+		return err
+	}
+	return c.wait()
+}
+
+func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commit, error) {
 	db.writeMu.Lock()
 	defer db.writeMu.Unlock()
 
@@ -363,44 +375,73 @@ func (db *DB) Update(key []byte, fn func(cur *Item) (next *Item, write bool, err
 	case err == nil:
 		cur = &item
 	case !errors.Is(err, ErrNotFound):
-		return err
+		return commit{}, err
 	}
 	next, write, err := fn(cur)
 	if err != nil || !write {
-		return err
+		return commit{}, err
 	}
 	e := base.Entry{Key: key, Kind: base.KindDelete}
 	if next != nil {
 		e = base.Entry{Key: key, Value: next.Value, Kind: base.KindSet, ExpireAt: next.ExpireAt}
 	} else if cur == nil {
-		return nil // deleting a key that is already gone
+		return commit{}, nil // deleting a key that is already gone
 	}
-	return db.writeLocked([]base.Entry{e})
+	return db.applyLocked([]base.Entry{e})
 }
 
-func (db *DB) writeLocked(entries []base.Entry) error {
-	if len(entries) == 0 {
+// commit identifies a write that has been applied to the memtable but may
+// not yet be durable.
+type commit struct {
+	w   *wal.Writer
+	lsn uint64
+}
+
+// wait blocks until the write is durable according to the sync mode.
+func (c commit) wait() error {
+	if c.w == nil {
 		return nil
+	}
+	return c.w.Commit(c.lsn)
+}
+
+// applyLocked appends entries to the WAL buffer and the memtable. The caller
+// holds writeMu and must call wait on the result after releasing it.
+//
+// This is group commit with early lock release: the next writer can apply
+// its changes while this one waits for I/O, and one leader writes and
+// fsyncs the log for everyone waiting. A concurrent reader may therefore see
+// a write slightly before it is durable (as in Redis), but a client is only
+// acknowledged once its write is durable, and the log preserves order, so a
+// crash can only lose a suffix of unacknowledged writes.
+func (db *DB) applyLocked(entries []base.Entry) (commit, error) {
+	if len(entries) == 0 {
+		return commit{}, nil
 	}
 	db.mu.RLock()
 	closed, bgErr := db.closed, db.bgErr
 	db.mu.RUnlock()
 	if closed {
-		return ErrClosed
+		return commit{}, ErrClosed
 	}
 	if bgErr != nil {
-		return bgErr
+		return commit{}, bgErr
 	}
-	if err := db.wal.Append(entries...); err != nil {
-		return err
+	w := db.wal
+	lsn, err := w.Append(entries...)
+	if err != nil {
+		return commit{}, err
 	}
 	for _, e := range entries {
 		db.mem.Put(e)
 	}
 	if db.mem.Size() >= db.opts.MemtableSize {
-		return db.rotate()
+		// rotate closes w, which writes and fsyncs everything buffered in it.
+		if err := db.rotate(); err != nil {
+			return commit{}, err
+		}
 	}
-	return nil
+	return commit{w: w, lsn: lsn}, nil
 }
 
 // rotate freezes the current memtable and starts a new memtable and log.

@@ -63,14 +63,29 @@ const headerSize = 8
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// Writer appends batches to a log file.
+// Writer appends batches to a log file with group commit.
+//
+// Append only encodes a record into an in-memory buffer and returns its log
+// sequence number (LSN), the byte offset just past the record. Commit then
+// waits until the record has reached the OS (and, under SyncAlways, the
+// disk). The first committer to arrive becomes the leader: it writes out
+// everything buffered so far with one write(2), and one fsync if required,
+// while later committers wait. So N concurrent writers cost one syscall
+// round instead of N.
 type Writer struct {
-	mu    sync.Mutex
-	f     *os.File
-	mode  SyncMode
-	buf   []byte
-	dirty bool
-	err   error
+	mu   sync.Mutex
+	cond *sync.Cond
+	f    *os.File
+	mode SyncMode
+
+	buf      []byte // appended but not yet written
+	spare    []byte // recycled buffer, swapped with buf by the leader
+	appended uint64 // LSN of the end of buf
+	written  uint64 // bytes handed to the OS
+	synced   uint64 // bytes known to be on disk
+	leading  bool   // a leader is writing outside the lock
+	dirty    bool   // written but not yet fsynced (SyncEverySec)
+	err      error
 
 	stop chan struct{}
 	done chan struct{}
@@ -87,6 +102,7 @@ func Create(path string, mode SyncMode) (*Writer, error) {
 		return nil, err
 	}
 	w := &Writer{f: f, mode: mode}
+	w.cond = sync.NewCond(&w.mu)
 	if mode == SyncEverySec {
 		w.stop = make(chan struct{})
 		w.done = make(chan struct{})
@@ -105,63 +121,120 @@ func (w *Writer) syncLoop() {
 			return
 		case <-t.C:
 			w.mu.Lock()
-			if w.dirty && w.err == nil {
-				if err := w.f.Sync(); err != nil {
-					w.err = err
-				}
-				w.dirty = false
+			if !w.dirty || w.err != nil {
+				w.mu.Unlock()
+				continue
 			}
+			w.dirty = false
 			w.mu.Unlock()
+			// fsync without holding the lock so appends and writes continue.
+			if err := w.f.Sync(); err != nil {
+				w.mu.Lock()
+				w.err = err
+				w.cond.Broadcast()
+				w.mu.Unlock()
+			}
 		}
 	}
 }
 
-// Append writes entries as a single atomic record.
-func (w *Writer) Append(entries ...base.Entry) error {
+// Append encodes entries as a single atomic record into the in-memory buffer
+// and returns the record's LSN. It performs no I/O; call Commit to make the
+// record durable.
+func (w *Writer) Append(entries ...base.Entry) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.err != nil {
-		return w.err
+		return 0, w.err
 	}
-
-	buf := append(w.buf[:0], make([]byte, headerSize)...)
-	buf = binary.AppendUvarint(buf, uint64(len(entries)))
+	start := len(w.buf)
+	w.buf = append(w.buf, make([]byte, headerSize)...)
+	w.buf = binary.AppendUvarint(w.buf, uint64(len(entries)))
 	for i := range entries {
-		buf = base.AppendEntry(buf, &entries[i])
+		w.buf = base.AppendEntry(w.buf, &entries[i])
 	}
-	binary.LittleEndian.PutUint32(buf[4:8], uint32(len(buf)-headerSize))
-	binary.LittleEndian.PutUint32(buf[0:4], crc32.Checksum(buf[4:], crcTable))
-	w.buf = buf
-
-	if _, err := w.f.Write(buf); err != nil {
-		w.err = err
-		return err
-	}
-	if w.mode == SyncAlways {
-		if err := w.f.Sync(); err != nil {
-			w.err = err
-			return err
-		}
-	} else {
-		w.dirty = true
-	}
-	return nil
+	rec := w.buf[start:]
+	binary.LittleEndian.PutUint32(rec[4:8], uint32(len(rec)-headerSize))
+	binary.LittleEndian.PutUint32(rec[0:4], crc32.Checksum(rec[4:], crcTable))
+	w.appended += uint64(len(rec))
+	return w.appended, nil
 }
 
-// Close syncs and closes the log.
+// durableLocked returns the LSN up to which Commit may return.
+func (w *Writer) durableLocked() uint64 {
+	if w.mode == SyncAlways {
+		return w.synced
+	}
+	return w.written
+}
+
+// Commit blocks until every record up to lsn is written to the OS and, in
+// SyncAlways mode, fsynced. Concurrent callers share writes and fsyncs.
+func (w *Writer) Commit(lsn uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for {
+		if w.durableLocked() >= lsn {
+			return nil
+		}
+		if w.err != nil {
+			return w.err
+		}
+		if w.leading {
+			w.cond.Wait()
+			continue
+		}
+
+		// Become the leader for everything appended so far.
+		w.leading = true
+		data, target := w.buf, w.appended
+		w.buf, w.spare = w.spare[:0], nil
+		w.mu.Unlock()
+
+		_, err := w.f.Write(data)
+		if err == nil && w.mode == SyncAlways {
+			err = w.f.Sync()
+		}
+
+		w.mu.Lock()
+		w.leading = false
+		w.spare = data[:0]
+		if err != nil {
+			w.err = err
+		} else {
+			w.written = target
+			if w.mode == SyncAlways {
+				w.synced = target
+			} else {
+				w.dirty = true
+			}
+		}
+		w.cond.Broadcast()
+	}
+}
+
+// Close writes out any buffered records, fsyncs and closes the log.
 func (w *Writer) Close() error {
 	if w.stop != nil {
 		close(w.stop)
 		<-w.done
 	}
 	w.mu.Lock()
+	lsn := w.appended
+	w.mu.Unlock()
+	err := w.Commit(lsn)
+
+	w.mu.Lock()
 	defer w.mu.Unlock()
-	err := w.err
 	if serr := w.f.Sync(); err == nil {
 		err = serr
 	}
+	w.synced = w.written
 	if cerr := w.f.Close(); err == nil {
 		err = cerr
+	}
+	if err != nil && w.err == nil {
+		w.err = err
 	}
 	return err
 }
