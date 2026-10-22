@@ -436,3 +436,82 @@ func BenchmarkGet(b *testing.B) {
 		db.Get([]byte(fmt.Sprintf("key-%010d", i%n)))
 	}
 }
+
+func TestTxnReadsOwnWritesAndIsAtomic(t *testing.T) {
+	db := mustOpen(t, t.TempDir(), smallOpts())
+	defer db.Close()
+
+	err := db.Txn(func(tx *Txn) error {
+		tx.Set([]byte("a"), []byte("1"), 0)
+		if it, err := tx.Get([]byte("a")); err != nil || string(it.Value) != "1" {
+			t.Errorf("tx.Get(a) = %q, %v", it.Value, err)
+		}
+		tx.Delete([]byte("a"))
+		if _, err := tx.Get([]byte("a")); !errors.Is(err, ErrNotFound) {
+			t.Errorf("tx.Get after Delete = %v", err)
+		}
+		tx.Set([]byte("b"), []byte("2"), 0)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustMissing(t, db, "a")
+	mustGet(t, db, "b", "2")
+
+	// An error aborts every staged write.
+	boom := errors.New("boom")
+	if err := db.Txn(func(tx *Txn) error {
+		tx.Set([]byte("c"), []byte("3"), 0)
+		return boom
+	}); !errors.Is(err, boom) {
+		t.Fatalf("Txn error = %v", err)
+	}
+	mustMissing(t, db, "c")
+
+	// Concurrent transfers between two keys keep the total constant.
+	db.Put([]byte("x"), []byte("1000"))
+	db.Put([]byte("y"), []byte("0"))
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				db.Txn(func(tx *Txn) error {
+					var x, y int
+					a, _ := tx.Get([]byte("x"))
+					b, _ := tx.Get([]byte("y"))
+					fmt.Sscan(string(a.Value), &x)
+					fmt.Sscan(string(b.Value), &y)
+					tx.Set([]byte("x"), []byte(fmt.Sprint(x-1)), 0)
+					tx.Set([]byte("y"), []byte(fmt.Sprint(y+1)), 0)
+					return nil
+				})
+			}
+		}()
+	}
+	wg.Wait()
+	mustGet(t, db, "x", "200")
+	mustGet(t, db, "y", "800")
+}
+
+func TestCompactionFilter(t *testing.T) {
+	opts := smallOpts()
+	opts.CompactionFilter = func(key []byte, _ Item) bool { return bytes.HasPrefix(key, []byte("tmp:")) }
+	db := mustOpen(t, t.TempDir(), opts)
+	defer db.Close()
+	for i := 0; i < 200; i++ {
+		db.Put([]byte(fmt.Sprintf("tmp:%d", i)), []byte("x"))
+		db.Put([]byte(fmt.Sprintf("keep:%d", i)), []byte("x"))
+	}
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	st := db.Stats()
+	if len(st.Tables) != 1 || st.Tables[0].Keys != 200 {
+		t.Fatalf("after Compact: %+v, want one table with 200 keys", st.Tables)
+	}
+	mustMissing(t, db, "tmp:7")
+	mustGet(t, db, "keep:7", "x")
+}

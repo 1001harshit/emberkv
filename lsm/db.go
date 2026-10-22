@@ -54,6 +54,13 @@ type Options struct {
 	Logger *log.Logger
 	// Now returns the current time; used for TTLs. Default time.Now.
 	Now func() time.Time
+	// CompactionFilter, if set, is called for each value entry rewritten by a
+	// compaction; returning true drops the entry. It lets a layer above
+	// garbage-collect records that became unreachable, such as the fields of
+	// a deleted hash. It must only drop keys that can never become reachable
+	// again, because an older copy of a dropped key may still exist in older
+	// tables. It may read from the DB.
+	CompactionFilter func(key []byte, item Item) bool
 }
 
 func (o Options) withDefaults() Options {
@@ -226,7 +233,7 @@ func (db *DB) recover() error {
 		}
 	}
 	if mem.Len() > 0 {
-		t, err := db.writeTable(db.newFileID(), mem.Iterator(nil), false)
+		t, err := db.writeTable(db.newFileID(), mem.Iterator(nil), false, nil)
 		if err != nil {
 			return err
 		}
@@ -255,9 +262,9 @@ func (db *DB) saveManifestLocked() error {
 }
 
 // writeTable writes the entries from it to a new table. When bottom is true,
-// tombstones and expired entries are dropped. It returns nil if no entries
-// remain.
-func (db *DB) writeTable(id uint64, it base.Iterator, bottom bool) (*table, error) {
+// tombstones and expired entries are dropped; entries for which drop returns
+// true are dropped too. It returns nil if no entries remain.
+func (db *DB) writeTable(id uint64, it base.Iterator, bottom bool, drop func(*base.Entry) bool) (*table, error) {
 	path := db.tablePath(id)
 	w, err := sstable.Create(path, db.opts.BloomBitsPerKey)
 	if err != nil {
@@ -267,6 +274,9 @@ func (db *DB) writeTable(id uint64, it base.Iterator, bottom bool) (*table, erro
 	for it.Next() {
 		e := it.Entry()
 		if bottom && !e.Live(now) {
+			continue
+		}
+		if drop != nil && e.Kind == base.KindSet && drop(e) {
 			continue
 		}
 		if err := w.Add(e); err != nil {
@@ -388,6 +398,66 @@ func (db *DB) update(key []byte, fn func(cur *Item) (*Item, bool, error)) (commi
 		return commit{}, nil // deleting a key that is already gone
 	}
 	return db.applyLocked([]base.Entry{e})
+}
+
+// Txn is a read-modify-write transaction over any number of keys. It sees
+// its own pending writes, and its writes are applied as one atomic batch.
+type Txn struct {
+	db      *DB
+	entries []base.Entry
+	index   map[string]int
+}
+
+// Get returns the item for key as the transaction currently sees it.
+func (tx *Txn) Get(key []byte) (Item, error) {
+	if i, ok := tx.index[string(key)]; ok {
+		e := &tx.entries[i]
+		if !e.Live(tx.db.nowMs()) {
+			return Item{}, ErrNotFound
+		}
+		return Item{Value: e.Value, ExpireAt: e.ExpireAt}, nil
+	}
+	return tx.db.GetItem(key)
+}
+
+func (tx *Txn) put(e base.Entry) {
+	if i, ok := tx.index[string(e.Key)]; ok {
+		tx.entries[i] = e
+		return
+	}
+	if tx.index == nil {
+		tx.index = make(map[string]int)
+	}
+	tx.index[string(e.Key)] = len(tx.entries)
+	tx.entries = append(tx.entries, e)
+}
+
+// Set stages a write of key=value with an optional expiry (unix ms, 0 for none).
+func (tx *Txn) Set(key, value []byte, expireAt int64) {
+	tx.put(base.Entry{Key: key, Value: value, Kind: base.KindSet, ExpireAt: expireAt})
+}
+
+// Delete stages a deletion of key.
+func (tx *Txn) Delete(key []byte) {
+	tx.put(base.Entry{Key: key, Kind: base.KindDelete})
+}
+
+// Txn runs fn with exclusive access to the write path and atomically applies
+// the writes it stages, unless fn returns an error. Reads made through tx are
+// consistent with its writes because no other writer runs concurrently.
+func (db *DB) Txn(fn func(tx *Txn) error) error {
+	db.writeMu.Lock()
+	tx := &Txn{db: db}
+	err := fn(tx)
+	var c commit
+	if err == nil {
+		c, err = db.applyLocked(tx.entries)
+	}
+	db.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.wait()
 }
 
 // commit identifies a write that has been applied to the memtable but may
@@ -541,7 +611,7 @@ func (db *DB) flushLoop() {
 
 // flush writes the oldest frozen memtable to a new, newest table.
 func (db *DB) flush(im *immutable) error {
-	t, err := db.writeTable(db.newFileID(), im.mem.Iterator(nil), false)
+	t, err := db.writeTable(db.newFileID(), im.mem.Iterator(nil), false, nil)
 	if err != nil {
 		return err
 	}

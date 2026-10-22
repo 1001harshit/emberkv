@@ -131,7 +131,13 @@ func (db *DB) compactRun(inputs []*table, bottom bool) error {
 	for i, t := range inputs {
 		iters[i] = t.r.Iterator(nil)
 	}
-	out, err := db.writeTable(db.newFileID(), newMergeIterator(iters), bottom)
+	var drop func(*base.Entry) bool
+	if f := db.opts.CompactionFilter; f != nil {
+		drop = func(e *base.Entry) bool {
+			return f(e.Key, Item{Value: e.Value, ExpireAt: e.ExpireAt})
+		}
+	}
+	out, err := db.writeTable(db.newFileID(), newMergeIterator(iters), bottom, drop)
 	if err != nil {
 		return err
 	}
