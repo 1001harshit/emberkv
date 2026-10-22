@@ -113,3 +113,22 @@ func TestVersions(t *testing.T) {
 		t.Fatalf("versions of k in order %v", order)
 	}
 }
+
+func TestLatestOnly(t *testing.T) {
+	m := NewLatestOnly()
+	for v := uint64(1); v <= 100; v++ {
+		m.Put(base.Entry{Key: []byte("hot"), Value: []byte(fmt.Sprint(v)), Kind: base.KindSet, Version: v})
+	}
+	m.Put(base.Entry{Key: []byte("hot"), Value: []byte("stale"), Kind: base.KindSet, Version: 50}) // older: ignored
+	m.Put(base.Entry{Key: []byte("cold"), Value: []byte("x"), Kind: base.KindSet, Version: 7})
+	if m.Len() != 2 {
+		t.Fatalf("Len = %d, want 2 (one entry per key)", m.Len())
+	}
+	if e, ok := m.Get([]byte("hot"), base.MaxVersion); !ok || string(e.Value) != "100" {
+		t.Fatalf("Get(hot) = %q", e.Value)
+	}
+	m.Put(base.Entry{Key: []byte("hot"), Kind: base.KindDelete, Version: 101})
+	if e, _ := m.Get([]byte("hot"), base.MaxVersion); e.Kind != base.KindDelete {
+		t.Fatal("tombstone did not replace the value")
+	}
+}

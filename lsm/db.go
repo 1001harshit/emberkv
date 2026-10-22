@@ -283,7 +283,7 @@ func (db *DB) recover() error {
 
 	// Replay logs oldest first; together they hold every write not yet in a table.
 	sort.Slice(wals, func(i, j int) bool { return wals[i] < wals[j] })
-	mem := memtable.New()
+	mem := db.newMemtable()
 	for _, id := range wals {
 		_, err := wal.Replay(db.walFilePath(id), func(entries []base.Entry) error {
 			for _, e := range entries {
@@ -313,7 +313,7 @@ func (db *DB) recover() error {
 		os.Remove(db.walFilePath(id))
 	}
 
-	db.mem = memtable.New()
+	db.mem = db.newMemtable()
 	db.walPath = db.walFilePath(db.newFileID())
 	db.wal, err = wal.Create(db.walPath, db.opts.SyncMode)
 	return err
@@ -382,6 +382,15 @@ func signal(ch chan struct{}) {
 }
 
 func (db *DB) nowMs() int64 { return db.opts.Now().UnixMilli() }
+
+// newMemtable returns a memtable that keeps old versions only if History
+// can ask for them.
+func (db *DB) newMemtable() *memtable.Memtable {
+	if db.opts.History > 0 {
+		return memtable.New()
+	}
+	return memtable.NewLatestOnly()
+}
 
 // horizon is the oldest version that reads must still be able to see.
 func (db *DB) horizon() uint64 {
@@ -674,7 +683,7 @@ func (db *DB) rotate() error {
 	}
 	old := db.wal
 	db.imm = append([]*immutable{{mem: db.mem, walPath: db.walPath}}, db.imm...)
-	db.mem = memtable.New()
+	db.mem = db.newMemtable()
 	db.wal, db.walPath = w, path
 	db.mu.Unlock()
 

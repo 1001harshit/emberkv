@@ -142,9 +142,10 @@ def make_servers(emberkv, work, baseline=None):
     def d(name):
         return os.path.join(work, name, "data")
 
-    def ember(name, port, fsync, binary=emberkv, label="emberkv"):
-        return Native(f"{label} (fsync {fsync})", port,
-                      [binary, "-addr", f"127.0.0.1:{port}", "-dir", d(name), "-fsync", fsync], d(name), True)
+    def ember(name, port, fsync, binary=emberkv, label="emberkv", extra=(), note=""):
+        return Native(f"{label} (fsync {fsync}{note})", port,
+                      [binary, "-addr", f"127.0.0.1:{port}", "-dir", d(name), "-fsync", fsync] + list(extra),
+                      d(name), True)
 
     before = {}
     if baseline:
@@ -161,6 +162,7 @@ def make_servers(emberkv, work, baseline=None):
     return before | {
         "ember-es": ember("ember-es", 7001, "everysec"),
         "ember-always": ember("ember-always", 7002, "always"),
+        "ember-nohist": ember("ember-nohist", 7010, "everysec", extra=["-history", "0"], note=", history off"),
         "redis-rdb": redis_server("Redis (default: RDB snapshots)", 7003, "redis-rdb",
                                   ["--appendonly", "no", "--save", "3600 1 300 100 60 10000"]),
         "redis-aof-es": redis_server("Redis (AOF everysec)", 7004, "redis-aof-es",
@@ -472,7 +474,7 @@ def main():
         for s in servers.values():
             s.stop()
         res["footprint"] = {}
-        for key in ("ember-es", "redis-aof-es", "kvrocks", "dragonfly"):
+        for key in ("ember-es", "ember-nohist", "redis-aof-es", "kvrocks", "dragonfly"):
             print(f"   {servers[key].name}", flush=True)
             res["footprint"][key] = footprint(servers[key])
             servers[key].stop()

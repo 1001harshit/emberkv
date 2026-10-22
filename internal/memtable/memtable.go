@@ -19,21 +19,32 @@ type node struct {
 
 // Memtable is a concurrency-safe sorted set of versioned entries.
 type Memtable struct {
-	mu     sync.RWMutex
-	head   *node
-	height int
-	rnd    uint64
-	size   int
-	count  int
+	mu         sync.RWMutex
+	head       *node
+	height     int
+	rnd        uint64
+	size       int
+	count      int
+	latestOnly bool
 }
 
-// New returns an empty memtable.
+// New returns an empty memtable that keeps every version of a key.
 func New() *Memtable {
 	return &Memtable{
 		head:   &node{next: make([]*node, maxHeight)},
 		height: 1,
 		rnd:    0x9E3779B97F4A7C15,
 	}
+}
+
+// NewLatestOnly returns an empty memtable that keeps only the newest version
+// of each key, replacing it in place on overwrite. Use it when no reader can
+// ask for older versions (no history is kept): it keeps the memtable small
+// under repeated overwrites of hot keys.
+func NewLatestOnly() *Memtable {
+	m := New()
+	m.latestOnly = true
+	return m
 }
 
 // randomHeight returns a height with P(h) = 1/4^(h-1), via xorshift.
@@ -81,6 +92,15 @@ func (m *Memtable) Put(e base.Entry) {
 	defer m.mu.Unlock()
 
 	var prev [maxHeight]*node
+	if m.latestOnly {
+		if n := m.findGE(e.Key, base.MaxVersion, nil); n != nil && bytes.Equal(n.entry.Key, e.Key) {
+			if e.Version >= n.entry.Version {
+				m.size += e.Size() - n.entry.Size()
+				n.entry = e
+			}
+			return
+		}
+	}
 	n := m.findGE(e.Key, e.Version, prev[:])
 	if n != nil && n.entry.Version == e.Version && bytes.Equal(n.entry.Key, e.Key) {
 		m.size += e.Size() - n.entry.Size()
