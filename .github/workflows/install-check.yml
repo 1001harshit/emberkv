@@ -14,7 +14,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: Homebrew/actions/setup-homebrew@master
+      - uses: Homebrew/actions/setup-homebrew@main
       - run: brew install 1001harshit/tap/emberkv
       - run: emberkv -version
       - run: brew test emberkv
