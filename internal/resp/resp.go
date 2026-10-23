@@ -237,5 +237,8 @@ func (w *Writer) WriteCommand(args ...string) {
 	}
 }
 
+// WriteRaw writes already-encoded RESP data.
+func (w *Writer) WriteRaw(b []byte) { w.bw.Write(b) }
+
 // Flush sends buffered data.
 func (w *Writer) Flush() error { return w.bw.Flush() }

@@ -40,57 +40,63 @@ var commands map[string]command
 
 func init() {
 	commands = map[string]command{
-		"ping":      {cmdPing, -1},
-		"echo":      {cmdEcho, 2},
-		"quit":      {cmdQuit, -1},
-		"select":    {cmdSelect, 2},
-		"get":       {cmdGet, 2},
-		"set":       {cmdSet, -3},
-		"setnx":     {cmdSetNX, 3},
-		"setex":     {cmdSetEx(time.Second), 4},
-		"psetex":    {cmdSetEx(time.Millisecond), 4},
-		"getset":    {cmdGetSet, 3},
-		"getdel":    {cmdGetDel, 2},
-		"del":       {cmdDel, -2},
-		"unlink":    {cmdDel, -2},
-		"exists":    {cmdExists, -2},
-		"incr":      {cmdIncr(1), 2},
-		"decr":      {cmdIncr(-1), 2},
-		"incrby":    {cmdIncrBy(1), 3},
-		"decrby":    {cmdIncrBy(-1), 3},
-		"append":    {cmdAppend, 3},
-		"strlen":    {cmdStrlen, 2},
-		"mget":      {cmdMGet, -2},
-		"mset":      {cmdMSet, -3},
-		"expire":    {cmdExpire(time.Second, false), 3},
-		"pexpire":   {cmdExpire(time.Millisecond, false), 3},
-		"expireat":  {cmdExpire(time.Second, true), 3},
-		"pexpireat": {cmdExpire(time.Millisecond, true), 3},
-		"ttl":       {cmdTTL(time.Second), 2},
-		"pttl":      {cmdTTL(time.Millisecond), 2},
-		"persist":   {cmdPersist, 2},
-		"type":      {cmdType, 2},
-		"keys":      {cmdKeys, 2},
-		"scan":      {cmdScan, -2},
-		"dbsize":    {cmdDBSize, 1},
-		"flushdb":   {cmdFlushDB, -1},
-		"flushall":  {cmdFlushDB, -1},
-		"compact":   {cmdCompact, 1},
-		"asof":      {cmdAsOf, -3},
-		"history":   {cmdHistory, -2},
-		"rollback":  {cmdRollback, 2},
-		"branch":    {cmdBranch, -2},
-		"auth":      {cmdAuth, -2},
-		"multi":     {cmdMulti, 1},
-		"exec":      {nil, 1}, // handled by Server.exec
-		"discard":   {cmdDiscard, 1},
-		"watch":     {cmdWatch, -2},
-		"unwatch":   {cmdUnwatch, 1},
-		"info":      {cmdInfo, -1},
-		"time":      {cmdTime, 1},
-		"command":   {cmdCommand, -1},
-		"client":    {cmdClient, -2},
-		"config":    {cmdConfig, -2},
+		"ping":         {cmdPing, -1},
+		"echo":         {cmdEcho, 2},
+		"quit":         {cmdQuit, -1},
+		"select":       {cmdSelect, 2},
+		"get":          {cmdGet, 2},
+		"set":          {cmdSet, -3},
+		"setnx":        {cmdSetNX, 3},
+		"setex":        {cmdSetEx(time.Second), 4},
+		"psetex":       {cmdSetEx(time.Millisecond), 4},
+		"getset":       {cmdGetSet, 3},
+		"getdel":       {cmdGetDel, 2},
+		"del":          {cmdDel, -2},
+		"unlink":       {cmdDel, -2},
+		"exists":       {cmdExists, -2},
+		"incr":         {cmdIncr(1), 2},
+		"decr":         {cmdIncr(-1), 2},
+		"incrby":       {cmdIncrBy(1), 3},
+		"decrby":       {cmdIncrBy(-1), 3},
+		"append":       {cmdAppend, 3},
+		"strlen":       {cmdStrlen, 2},
+		"mget":         {cmdMGet, -2},
+		"mset":         {cmdMSet, -3},
+		"expire":       {cmdExpire(time.Second, false), 3},
+		"pexpire":      {cmdExpire(time.Millisecond, false), 3},
+		"expireat":     {cmdExpire(time.Second, true), 3},
+		"pexpireat":    {cmdExpire(time.Millisecond, true), 3},
+		"ttl":          {cmdTTL(time.Second), 2},
+		"pttl":         {cmdTTL(time.Millisecond), 2},
+		"persist":      {cmdPersist, 2},
+		"type":         {cmdType, 2},
+		"keys":         {cmdKeys, 2},
+		"scan":         {cmdScan, -2},
+		"dbsize":       {cmdDBSize, 1},
+		"flushdb":      {cmdFlushDB, -1},
+		"flushall":     {cmdFlushDB, -1},
+		"compact":      {cmdCompact, 1},
+		"asof":         {cmdAsOf, -3},
+		"history":      {cmdHistory, -2},
+		"rollback":     {cmdRollback, 2},
+		"branch":       {cmdBranch, -2},
+		"auth":         {cmdAuth, -2},
+		"multi":        {cmdMulti, 1},
+		"exec":         {nil, 1}, // handled by Server.exec
+		"discard":      {cmdDiscard, 1},
+		"watch":        {cmdWatch, -2},
+		"unwatch":      {cmdUnwatch, 1},
+		"subscribe":    {cmdSubscribe(false), -2},
+		"psubscribe":   {cmdSubscribe(true), -2},
+		"unsubscribe":  {cmdUnsubscribe(false), -1},
+		"punsubscribe": {cmdUnsubscribe(true), -1},
+		"publish":      {cmdPublish, 3},
+		"pubsub":       {cmdPubSub, -2},
+		"info":         {cmdInfo, -1},
+		"time":         {cmdTime, 1},
+		"command":      {cmdCommand, -1},
+		"client":       {cmdClient, -2},
+		"config":       {cmdConfig, -2},
 	}
 	for _, group := range []map[string]command{containerCommands, listCommands, zsetCommands} {
 		for name, cmd := range group {
@@ -166,6 +172,16 @@ func (c *ctx) get(key []byte) (*lsm.Item, error) {
 // ---- connection ----
 
 func cmdPing(c *ctx) {
+	if c.conn.sub != nil { // in subscriber mode Redis replies with an array
+		c.w.WriteArray(2)
+		c.w.WriteBulkString("pong")
+		if len(c.args) > 1 {
+			c.w.WriteBulk(c.args[1])
+		} else {
+			c.w.WriteBulkString("")
+		}
+		return
+	}
 	switch len(c.args) {
 	case 1:
 		c.w.WriteSimple("PONG")

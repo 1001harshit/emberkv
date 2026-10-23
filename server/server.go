@@ -29,6 +29,7 @@ type Server struct {
 	logger   *log.Logger
 	started  time.Time
 	cursors  *cursorTable
+	pubsub   *hub
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -50,6 +51,7 @@ func New(st *keyspace.Store, logger *log.Logger) *Server {
 		logger:  logger,
 		started: time.Now(),
 		cursors: newCursorTable(4096),
+		pubsub:  newHub(),
 		conns:   make(map[net.Conn]struct{}),
 	}
 }
@@ -153,8 +155,9 @@ func (s *Server) handle(conn net.Conn) {
 	// whole batch durable, so a pipeline of N writes costs one log write
 	// while no reply ever reports a write that could still be lost.
 	var pending keyspace.Pending
-	cs := &connState{pending: &pending}
+	cs := &connState{pending: &pending, netConn: conn, w: w}
 	cs.use(MainBranch, s.st)
+	defer s.pubsub.drop(cs)
 	for {
 		args, err := r.ReadCommand()
 		if err != nil {
@@ -168,20 +171,25 @@ func (s *Server) handle(conn net.Conn) {
 			continue
 		}
 		s.totalCmds.Add(1)
+		// wmu guards w: Pub/Sub messages are written by another goroutine.
+		cs.wmu.Lock()
 		quit := s.dispatch(cs, w, args)
 		// Reply only when no pipelined commands are waiting, so a pipeline of
 		// N commands costs one log write and one network write instead of N.
 		if quit || r.Buffered() == 0 {
 			if err := pending.Wait(); err != nil {
+				cs.wmu.Unlock()
 				// The writes may not be durable: drop the connection rather
 				// than send replies that claim they are.
 				s.logger.Printf("closing connection: %v", err)
 				return
 			}
 			if err := w.Flush(); err != nil {
+				cs.wmu.Unlock()
 				return
 			}
 		}
+		cs.wmu.Unlock()
 		if quit {
 			return
 		}
@@ -196,7 +204,14 @@ type connState struct {
 	queue    [][][]byte
 	watches  []watch
 
-	authed  bool
+	authed bool
+
+	// Pub/Sub: the connection and its writer, guarded by wmu, and the
+	// subscription state once it subscribes.
+	netConn net.Conn
+	w       *resp.Writer
+	wmu     sync.Mutex
+	sub     *subscriber
 	branch  string
 	st      *keyspace.Store // a session on the branch's store
 	pending *keyspace.Pending
@@ -224,6 +239,10 @@ func (s *Server) dispatch(cs *connState, w *resp.Writer, args [][]byte) (quit bo
 	if s.password != "" && !cs.authed && !noAuthCommands[name] {
 		w.WriteError("NOAUTH Authentication required.")
 		cs.failTx()
+		return false
+	}
+	if cs.sub != nil && !subscribedOK[name] {
+		w.WriteError("ERR Can't execute '" + name + "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context")
 		return false
 	}
 	if cs.inMulti && !txControl[name] {
