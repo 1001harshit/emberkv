@@ -162,14 +162,55 @@ func (m *Memtable) Versions(key []byte) base.Iterator {
 	return base.NewSliceIterator(entries)
 }
 
-// Iterator returns an iterator over a point-in-time snapshot of every
-// version of every key >= start (nil means from the beginning).
+// Iterator returns an iterator over every version of every key >= start
+// (nil means from the beginning). It copies entries a small batch at a time
+// rather than all at once, so a scan that stops early costs only what it
+// reads. Entries are never removed, so it walks forward from where the last
+// batch ended; an entry added meanwhile ahead of that point may be seen, one
+// added behind it is not.
 func (m *Memtable) Iterator(start []byte) base.Iterator {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var entries []base.Entry
-	for n := m.findGE(start, base.MaxVersion, nil); n != nil; n = n.next[0] {
-		entries = append(entries, n.entry)
-	}
-	return base.NewSliceIterator(entries)
+	return &iterator{m: m, start: start, batch: 16}
 }
+
+type iterator struct {
+	m       *Memtable
+	start   []byte
+	last    *node // last node copied, nil before the first batch
+	done    bool
+	batch   int
+	entries []base.Entry
+	i       int
+}
+
+func (it *iterator) Next() bool {
+	it.i++
+	if it.i < len(it.entries) {
+		return true
+	}
+	if it.done {
+		return false
+	}
+	it.fill()
+	return it.i < len(it.entries)
+}
+
+// fill copies the next batch of entries, doubling the batch size each time
+// up to a limit.
+func (it *iterator) fill() {
+	it.m.mu.RLock()
+	defer it.m.mu.RUnlock()
+	n := it.m.findGE(it.start, base.MaxVersion, nil)
+	if it.last != nil {
+		n = it.last.next[0]
+	}
+	it.entries, it.i = it.entries[:0], 0
+	for ; n != nil && len(it.entries) < it.batch; n = n.next[0] {
+		it.entries = append(it.entries, n.entry)
+		it.last = n
+	}
+	it.done = n == nil
+	it.batch = min(it.batch*2, 1024)
+}
+
+func (it *iterator) Entry() *base.Entry { return &it.entries[it.i] }
+func (it *iterator) Err() error         { return nil }

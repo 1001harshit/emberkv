@@ -123,7 +123,7 @@ type meta struct {
 	value      []byte // strings
 	version    uint64 // containers
 	size       int64  // containers
-	head, tail uint64 // lists: elements occupy [head, tail)
+	head, tail uint64 // lists: elements occupy [head, tail); zsets: head is the floor
 	expireAt   int64
 }
 
@@ -138,7 +138,7 @@ func decodeMeta(item lsm.Item) (meta, error) {
 		m.value = v[1:]
 	case TypeHash, TypeSet, TypeZSet, TypeList:
 		want := 17
-		if m.typ == TypeList {
+		if m.typ == TypeList || m.typ == TypeZSet {
 			want = 33
 		}
 		if len(v) != want {
@@ -146,7 +146,7 @@ func decodeMeta(item lsm.Item) (meta, error) {
 		}
 		m.version = binary.BigEndian.Uint64(v[1:9])
 		m.size = int64(binary.BigEndian.Uint64(v[9:17]))
-		if m.typ == TypeList {
+		if want == 33 {
 			m.head = binary.BigEndian.Uint64(v[17:25])
 			m.tail = binary.BigEndian.Uint64(v[25:33])
 		}
@@ -161,14 +161,14 @@ func (m *meta) encode() []byte {
 		return append([]byte{byte(TypeString)}, m.value...)
 	}
 	n := 17
-	if m.typ == TypeList {
+	if m.typ == TypeList || m.typ == TypeZSet {
 		n = 33
 	}
 	b := make([]byte, n)
 	b[0] = byte(m.typ)
 	binary.BigEndian.PutUint64(b[1:], m.version)
 	binary.BigEndian.PutUint64(b[9:], uint64(m.size))
-	if m.typ == TypeList {
+	if n == 33 {
 		binary.BigEndian.PutUint64(b[17:], m.head)
 		binary.BigEndian.PutUint64(b[25:], m.tail)
 	}

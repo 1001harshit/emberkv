@@ -44,6 +44,16 @@ func encodeScore(f float64) []byte {
 	return binary.BigEndian.AppendUint64(nil, b)
 }
 
+// A sorted set's metadata keeps a floor in head: an encoded score at or
+// below every member's (0, below any encoded score, means none). ZPOPMIN
+// raises it past the members it removes, so later reads start their scan
+// after them instead of stepping over their deleted index records, which
+// would make draining a set quadratic.
+
+func (c *container) lowerFloor(score float64) {
+	c.m.head = min(c.m.head, binary.BigEndian.Uint64(encodeScore(score)))
+}
+
 func decodeScore(p []byte) float64 {
 	b := binary.BigEndian.Uint64(p)
 	if b>>63 == 1 {
@@ -79,6 +89,7 @@ func (c *container) setScore(member []byte, old float64, had bool, score float64
 	}
 	c.tx.Set(memberKey(c.key, c.m.version, member), binary.BigEndian.AppendUint64(nil, math.Float64bits(score)), 0)
 	c.tx.Set(c.scoreKey(score, member), nil, 0)
+	c.lowerFloor(score)
 }
 
 func (c *container) removeMember(member []byte, score float64) {
@@ -97,6 +108,9 @@ func (s *Store) ZAdd(key []byte, members []ScoredMember, o ZAddOptions) (int64, 
 		c, err := s.openContainer(tx, key, TypeZSet, !o.XX)
 		if err != nil || c == nil {
 			return err
+		}
+		if c.new {
+			c.m.head = math.MaxUint64
 		}
 		for _, sm := range members {
 			old, had, err := c.memberScore(sm.Member)
@@ -177,10 +191,11 @@ func (s *Store) ZCard(key []byte) (int64, error) { return s.size(key, TypeZSet) 
 // at score from (nil for the lowest), until fn returns false.
 func (s *Store) byScore(key []byte, m *meta, from *float64, fn func(sm ScoredMember) bool) error {
 	prefix := scorePrefixOf(key, m.version)
-	start := prefix
+	floor := m.head
 	if from != nil {
-		start = append(bytes.Clone(prefix), encodeScore(*from)...)
+		floor = max(floor, binary.BigEndian.Uint64(encodeScore(*from)))
 	}
+	start := binary.BigEndian.AppendUint64(bytes.Clone(prefix), floor)
 	return s.db.ScanAt(start, s.at, func(k []byte, _ lsm.Item) bool {
 		if !bytes.HasPrefix(k, prefix) || len(k) < len(prefix)+8 {
 			return false
@@ -312,6 +327,9 @@ func (s *Store) ZPop(key []byte, max bool, count int64) ([]ScoredMember, error) 
 		out = window(out, 0, count)
 		for _, sm := range out {
 			c.removeMember(sm.Member, sm.Score)
+		}
+		if !max && len(out) > 0 {
+			c.m.head = binary.BigEndian.Uint64(encodeScore(out[len(out)-1].Score))
 		}
 		c.save()
 		return nil

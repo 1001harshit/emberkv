@@ -31,7 +31,9 @@ func (c *container) delElement(i uint64) {
 func (c *container) resize() { c.m.size = int64(c.m.tail - c.m.head) }
 
 // elements calls fn with the list's elements at absolute indexes from..to
-// (inclusive), in order, until fn returns false.
+// (inclusive), in order, until fn returns false. It stops at to rather than
+// at the first index past it, which after pops from the tail would mean
+// stepping over every deleted element beyond.
 func (s *Store) elements(key []byte, m *meta, from, to uint64, fn func(i uint64, v []byte) bool) error {
 	if from > to {
 		return nil
@@ -45,7 +47,7 @@ func (s *Store) elements(key []byte, m *meta, from, to uint64, fn func(i uint64,
 		if i > to {
 			return false
 		}
-		return fn(i, item.Value)
+		return fn(i, item.Value) && i < to
 	})
 }
 
