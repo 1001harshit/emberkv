@@ -81,9 +81,12 @@ Every write is stored as a new **version** with a timestamp, and versions are ke
 - **LSM storage engine.** A skip-list memtable flushes to sorted SSTables with 4 KiB checksummed blocks, a sparse index and a per-table Bloom filter (about 1% false positives). A sharded LRU **block cache** keeps hot blocks in memory.
 - **Parallel writes.** Striped per-key locks let read-modify-write commands on different keys run concurrently. Each client pipeline is made durable with one wait, as in Redis.
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
-- **Strings, hashes and sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field or member. Deleting or expiring a hash of any size is a single write, and a compaction filter later reclaims the orphaned fields.
+- **Strings, hashes, sets, lists and sorted sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field, member or element. Deleting or expiring a collection of any size is a single write, and a compaction filter later reclaims the orphaned records.
+- **Transactions:** `MULTI`/`EXEC`/`DISCARD` with optimistic locking through `WATCH`. No other client sees or interleaves with a half-applied transaction.
+- **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE` (glob patterns) and `PUBLISH`, with slow subscribers disconnected instead of blocking publishers.
+- **Security:** `AUTH` with `-requirepass`, and TLS with `-tls-cert`/`-tls-key`.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
-- **Atomic multi-key transactions.** `MSET` is all-or-nothing even across a crash. `INCR`, `SET NX`, `HSET`, `HINCRBY`, `SADD` and the rest are atomic.
+- **Atomic commands.** `MSET` is all-or-nothing even across a crash. `INCR`, `SET NX`, `HSET`, `HINCRBY`, `SADD`, `LMOVE`, `ZADD` and the rest are atomic.
 - **Embeddable.** The `lsm` package is a standalone Go key-value store, and `keyspace` adds Redis types on top. Neither needs the server.
 
 ## Install
@@ -141,6 +144,10 @@ make bench        # load test a running server
 | `-compaction-trigger` | `4` | number of SSTables before background compaction starts |
 | `-block-cache-mb` | `64` | memory for caching hot SSTable blocks (`0` disables) |
 | `-history` | `1h` | how far back `ASOF`, `HISTORY`, `ROLLBACK` and `BRANCH … ASOF` can reach (`0` keeps no history) |
+| `-requirepass` | `$EMBERKV_PASSWORD` | clients must `AUTH` with this password first. Prefer the environment variable, which keeps the password out of `ps` |
+| `-tls-cert`, `-tls-key` | | serve TLS only, with this certificate and key (PEM) |
+
+emberkv warns at startup if it listens beyond localhost without a password. Anyone who can reach an unprotected port can read and change everything.
 
 ### As a Go library
 
@@ -204,10 +211,15 @@ Tombstones and expired entries can only be dropped when the run includes the old
 **Data types (`keyspace/`).** Redis types are mapped onto the flat LSM keyspace the way [Apache Kvrocks](https://kvrocks.apache.org/community/data-structure-on-rocksdb) does it:
 
 ```
-'m' | key                                → type | string value          (TTL on this record)
-'m' | key                                → type | version | size        (hash / set metadata)
-'f' | len(key) | key | version | field   → field value ("" for set members)
+'m' | key                                        → type | string value                 (TTL on this record)
+'m' | key                                        → type | version | size [| head | tail]  (collections; lists add head/tail)
+'f' | len(key) | key | version | field           → field value (hash), "" (set)
+'f' | len(key) | key | version | index(8)        → list element
+'f' | len(key) | key | version | member          → score (sorted set)
+'z' | len(key) | key | version | score(8) | member → ""    (sorted set, ordered by score)
 ```
+
+A list's elements sit at positions `[head, tail)`, which start in the middle of the 64-bit range so the list can grow at either end: `LPUSH`, `RPOP` and friends are one write per element, and `LINDEX` is one lookup. `LREM` and `LINSERT` rewrite the list under a new version instead of shifting positions. A sorted set stores each member twice: member → score for `ZSCORE`, and a `'z'` record whose key sorts by score for `ZRANGE`, `ZRANGEBYSCORE` and `ZRANK`. Scores are encoded so that byte order equals numeric order, negatives included.
 
 Every operation first reads the key's metadata to get its type and current *version*, then reads or writes the member records under that version. All of it runs inside an `lsm.Txn`, so it is applied as one atomic WAL batch. Deleting, overwriting or expiring a hash with a million fields is therefore one metadata write: the old fields keep a version that is never read again. A [compaction filter](keyspace/keyspace.go) hook in the engine drops those orphaned records when compaction rewrites them. Versions come from a monotonic clock and are never reused, so a record that is stale once stays stale forever, which is what makes dropping it safe even in a non-bottom compaction. HGETALL, SMEMBERS and HKEYS are prefix scans over `'f' | key | version`. A plain `SET` is a blind write, with no read first, because it overwrites any type.
 
@@ -232,15 +244,25 @@ Format 2 added versions. A data directory written by v0.1.0 (format 1) is refuse
 | Strings | `GET` `SET [NX\|XX] [GET] [EX\|PX\|EXAT\|PXAT\|KEEPTTL]` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `MGET` `MSET` `APPEND` `STRLEN` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN [MATCH] [COUNT] [TYPE]` `DBSIZE` `FLUSHDB` `FLUSHALL` |
+| Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP [count]` `RPOP [count]` `LLEN` `LRANGE` `LINDEX` `LSET` `LTRIM` `LREM` `LINSERT` `LMOVE` `RPOPLPUSH` |
+| Sorted sets | `ZADD [NX\|XX] [GT\|LT] [CH] [INCR]` `ZINCRBY` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZCOUNT` `ZRANK` `ZREVRANK` `ZRANGE [BYSCORE] [REV] [LIMIT] [WITHSCORES]` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYSCORE` `ZREMRANGEBYRANK` |
+| Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
+| Pub/Sub | `SUBSCRIBE` `PSUBSCRIBE` `UNSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB CHANNELS\|NUMSUB\|NUMPAT` |
 | Hashes | `HSET` `HMSET` `HSETNX` `HGET` `HMGET` `HGETALL` `HKEYS` `HVALS` `HDEL` `HLEN` `HEXISTS` `HSTRLEN` `HINCRBY` |
 | Sets | `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SINTER` `SUNION` `SDIFF` |
 | Expiry | `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `TTL` `PTTL` `PERSIST` |
-| Server | `PING` `ECHO` `SELECT 0` `INFO [section]` `TIME` `QUIT` `COMMAND` `CLIENT` `CONFIG GET` |
+| Server | `AUTH` `PING` `ECHO` `SELECT 0` `INFO [section]` `TIME` `QUIT` `COMMAND` `CLIENT` `CONFIG GET` |
 | Time travel | `ASOF <time> <command…>` `HISTORY <key> [COUNT n]` `ROLLBACK <time>` |
 | Branches | `BRANCH CREATE <name> [ASOF <time>]` `BRANCH USE <name>` `BRANCH CURRENT` `BRANCH LIST` `BRANCH DROP <name>` |
 | emberkv | `COMPACT`: flush and fully compact, reclaiming space outside the history window |
 
-Strings, hashes and sets are supported, with Redis's `WRONGTYPE` errors. Lists and sorted sets are on the roadmap. There is a single database: `SELECT` accepts only `0`, as in Redis Cluster.
+Strings, hashes, sets, lists and sorted sets are supported, with Redis's `WRONGTYPE` errors.
+
+Not supported yet:
+- **Commands:** blocking list commands (`BLPOP`…), `ZRANGE … BYLEX`, set-operation `STORE` variants.
+- **Types:** streams, bitmaps, HyperLogLog, geo.
+- **Scripting:** Lua.
+- **Databases:** there is a single database; `SELECT` accepts only `0`, as in Redis Cluster.
 
 ## Testing
 
@@ -319,11 +341,14 @@ Effect of group commit on writes (pipeline 1):
 - [x] Versioned history (MVCC) with `ASOF`, `HISTORY`, `ROLLBACK` and instant `BRANCH`es
 - [ ] Merge a branch back into its parent
 - [ ] `HISTORY` for individual hash fields and set members
-- [ ] Lists and sorted sets
+- [x] Lists and sorted sets
+- [x] `MULTI`/`EXEC`/`WATCH` transactions and Pub/Sub
 - [ ] Snapshots and iterators that don't hold the read lock for the whole scan
 - [ ] Key-prefix compression inside blocks
 - [ ] Replication via WAL shipping
-- [ ] `AUTH` and TLS
+- [x] `AUTH` and TLS
+- [ ] Blocking list commands (`BLPOP`, `BRPOP`, `BLMOVE`)
+- [ ] Streams
 - [x] Release builds for Linux, macOS and Windows, a Homebrew tap, a curl installer and a Docker image
 
 ## License

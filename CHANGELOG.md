@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Lists:** `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`/`RPOP` with count, `LLEN`, `LRANGE`, `LINDEX`, `LSET`,
+  `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`.
+- **Sorted sets:** `ZADD` (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZINCRBY`, `ZREM`, `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`,
+  `ZRANK`, `ZREVRANK`, `ZRANGE` (`BYSCORE`/`REV`/`LIMIT`/`WITHSCORES`), `ZREVRANGE`, `ZRANGEBYSCORE`,
+  `ZREVRANGEBYSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`.
+- **Transactions:** `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. No client sees a half-applied transaction.
+- **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`. Slow subscribers are
+  disconnected rather than blocking publishers.
+- **Security:** `AUTH` with `-requirepass` / `$EMBERKV_PASSWORD`, and TLS with `-tls-cert` / `-tls-key`.
+
 ## v0.2.0: time travel and branches
 
 emberkv now remembers history. Read any key as it was minutes ago, undo an accidental
