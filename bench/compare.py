@@ -25,7 +25,7 @@ import time
 
 import redis
 
-TESTS = "set,get,incr,hset,sadd,mset"
+TESTS = "set,get,incr,hset,sadd,mset,lpush,lpop,rpush,rpop,lrange_100,zadd,zpopmin"
 
 
 # ---------------------------------------------------------------- servers
@@ -227,6 +227,27 @@ COMPAT = [
     # keyspace
     ["KEYS", "*"], ["KEYS", "s*"], ["KEYS", "h?"], ["DBSIZE"], ["PING"], ["PING", "hi"], ["ECHO", "e"],
     ["SELECT", "0"], ["SELECT", "1"], ["FLUSHDB"], ["DBSIZE"],
+    # lists
+    ["RPUSH", "L", "a", "b", "c"], ["LPUSH", "L", "x"], ["LRANGE", "L", "0", "-1"], ["LRANGE", "L", "-2", "10"],
+    ["LINDEX", "L", "1"], ["LINDEX", "L", "-9"], ["LLEN", "L"], ["LPOP", "L"], ["RPOP", "L", "2"],
+    ["LPOP", "nolist", "2"], ["LPOP", "nolist"], ["RPUSH", "L", "1", "2", "1"], ["LREM", "L", "-1", "1"],
+    ["LINSERT", "L", "BEFORE", "2", "z"], ["LINSERT", "L", "AFTER", "nope", "z"], ["LSET", "L", "0", "s"],
+    ["LSET", "L", "50", "s"], ["LSET", "nolist", "0", "s"], ["LTRIM", "L", "1", "-1"], ["LRANGE", "L", "0", "-1"],
+    ["RPOPLPUSH", "L", "L2"], ["LMOVE", "L", "L2", "LEFT", "LEFT"], ["LRANGE", "L2", "0", "-1"], ["TYPE", "L2"],
+    ["LPUSHX", "nolist", "a"], ["RPUSHX", "L2", "e"], ["LPOP", "L", "-1"], ["LPOP", "L2", "0"],
+    # sorted sets
+    ["ZADD", "Z", "1", "a", "2", "b", "2", "c", "-1.5", "d"], ["ZADD", "Z", "XX", "CH", "5", "a", "9", "nope"],
+    ["ZADD", "Z", "INCR", "0.5", "b"], ["ZADD", "Z", "NX", "INCR", "1", "a"], ["ZADD", "Z", "GT", "1", "a"],
+    ["ZRANGE", "Z", "0", "-1", "WITHSCORES"], ["ZREVRANGE", "Z", "0", "1"], ["ZRANGE", "Z", "1", "2", "REV"],
+    ["ZRANGEBYSCORE", "Z", "(-1.5", "+inf", "WITHSCORES", "LIMIT", "1", "2"], ["ZREVRANGEBYSCORE", "Z", "5", "2"],
+    ["ZRANGE", "Z", "(5", "-inf", "BYSCORE", "REV"], ["ZCOUNT", "Z", "-inf", "(2.5"], ["ZRANK", "Z", "c"],
+    ["ZREVRANK", "Z", "c"], ["ZRANK", "Z", "zz"], ["ZSCORE", "Z", "b"], ["ZSCORE", "Z", "zz"],
+    ["ZMSCORE", "Z", "a", "zz"], ["ZINCRBY", "Z", "0.1", "d"], ["ZCARD", "Z"], ["ZPOPMIN", "Z"],
+    ["ZPOPMAX", "Z", "2"], ["ZREM", "Z", "c", "zz"], ["ZADD", "Z2", "1", "a", "2", "b", "3", "c", "4", "d"],
+    ["ZREMRANGEBYRANK", "Z2", "0", "0"], ["ZREMRANGEBYSCORE", "Z2", "-inf", "(3"], ["ZRANGE", "Z2", "0", "-1"],
+    ["ZADD", "Z3", "+inf", "top", "-inf", "bottom", "0", "zero"], ["ZRANGE", "Z3", "0", "-1", "WITHSCORES"],
+    ["TYPE", "Z2"], ["ZADD", "Z", "abc", "x"], ["ZADD", "Z", "NX", "XX", "1", "x"], ["ZADD", "Z", "GT", "LT", "1", "x"],
+    ["ZCOUNT", "Z", "x", "1"], ["LPUSH", "Z2", "x"], ["ZADD", "L2", "1", "x"], ["ZPOPMIN", "nozset"],
     # errors
     ["NOSUCHCOMMAND", "x"], ["GET"], ["GET", "a", "b"],
 ]
@@ -300,6 +321,8 @@ def bench(port, pipeline, n):
         capture_output=True, text=True, timeout=1800).stdout
     rows = {}
     for row in csv.DictReader(io.StringIO(out)):
+        if "needed" in row["test"]:  # e.g. "LPUSH (needed to benchmark LRANGE)"
+            continue
         name = row["test"].split()[0]
         rows[name] = {"rps": float(row["rps"]), "p50_ms": float(row["p50_latency_ms"]),
                       "p99_ms": float(row["p99_latency_ms"])}
@@ -394,13 +417,14 @@ def report(res):
     w("")
 
     for p in ("1", "16"):
-        w(f"## Throughput, pipeline {p} (requests/s)\n")
-        names = ["SET", "GET", "INCR", "HSET", "SADD", "MSET"]
-        w("| Server | " + " | ".join(names) + " |\n|---|" + "---|" * len(names))
-        for key, rows in res["throughput"][p].items():
-            w(f"| {res['labels'][key]} | " + " | ".join(
-                f"{rows[n]['rps']:,.0f}" if n in rows else "-" for n in names) + " |")
-        w("")
+        for title, names in (("", ["SET", "GET", "INCR", "HSET", "SADD", "MSET"]),
+                             (", lists and sorted sets", ["LPUSH", "LPOP", "RPUSH", "RPOP", "LRANGE_100", "ZADD", "ZPOPMIN"])):
+            w(f"## Throughput{title}, pipeline {p} (requests/s)\n")
+            w("| Server | " + " | ".join(names) + " |\n|---|" + "---|" * len(names))
+            for key, rows in res["throughput"][p].items():
+                w(f"| {res['labels'][key]} | " + " | ".join(
+                    f"{rows[n]['rps']:,.0f}" if n in rows else "-" for n in names) + " |")
+            w("")
     w("## Latency, pipeline 1 (p50 / p99 ms)\n")
     w("| Server | SET | GET | HSET |\n|---|---|---|---|")
     for key, rows in res["throughput"]["1"].items():
