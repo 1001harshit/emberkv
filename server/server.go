@@ -24,6 +24,7 @@ var Version = "dev"
 type Server struct {
 	st       *keyspace.Store
 	branches *Branches // nil unless EnableBranches was called
+	password string    // empty: no AUTH required
 	logger   *log.Logger
 	started  time.Time
 	cursors  *cursorTable
@@ -188,6 +189,7 @@ func (s *Server) handle(conn net.Conn) {
 
 // connState is what a connection remembers between commands.
 type connState struct {
+	authed  bool
 	branch  string
 	st      *keyspace.Store // a session on the branch's store
 	pending *keyspace.Pending
@@ -206,6 +208,12 @@ func (s *Server) dispatch(cs *connState, w *resp.Writer, args [][]byte) (quit bo
 	}
 	if !cmd.arityOK(len(args)) {
 		w.WriteError("ERR wrong number of arguments for '" + name + "' command")
+		return false
+	}
+	// Same order as Redis: unknown commands and bad arity are reported
+	// before authentication is checked.
+	if s.password != "" && !cs.authed && !noAuthCommands[name] {
+		w.WriteError("NOAUTH Authentication required.")
 		return false
 	}
 	c := &ctx{s: s, st: cs.st, conn: cs, w: w, args: args}

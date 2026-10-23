@@ -80,6 +80,7 @@ func init() {
 		"history":   {cmdHistory, -2},
 		"rollback":  {cmdRollback, 2},
 		"branch":    {cmdBranch, -2},
+		"auth":      {cmdAuth, -2},
 		"info":      {cmdInfo, -1},
 		"time":      {cmdTime, 1},
 		"command":   {cmdCommand, -1},
