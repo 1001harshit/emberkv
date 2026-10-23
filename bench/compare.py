@@ -25,7 +25,11 @@ import time
 
 import redis
 
-TESTS = "set,get,incr,hset,sadd,mset,lpush,lpop,rpush,rpop,lrange_100,zadd,zpopmin"
+# redis-benchmark runs in groups, each with its own time limit, so one server
+# that stalls on one command loses only that group's rows. A pop test follows
+# the push that fills its key, so they share a group.
+TEST_GROUPS = ["set,get,incr,hset,sadd,mset", "lpush,lpop", "rpush,rpop", "lrange_100", "zadd,zpopmin"]
+GROUP_TIMEOUT = 300
 
 
 # ---------------------------------------------------------------- servers
@@ -315,17 +319,22 @@ def redis_cli_checks(port):
 # ------------------------------------------------------------- throughput
 
 def bench(port, pipeline, n):
-    out = subprocess.run(
-        ["redis-benchmark", "-p", str(port), "-c", "50", "-n", str(n), "-r", "100000", "-d", "64",
-         "-P", str(pipeline), "-t", TESTS, "--csv"],
-        capture_output=True, text=True, timeout=1800).stdout
     rows = {}
-    for row in csv.DictReader(io.StringIO(out)):
-        if "needed" in row["test"]:  # e.g. "LPUSH (needed to benchmark LRANGE)"
+    for tests in TEST_GROUPS:
+        try:
+            out = subprocess.run(
+                ["redis-benchmark", "-p", str(port), "-c", "50", "-n", str(n), "-r", "100000", "-d", "64",
+                 "-P", str(pipeline), "-t", tests, "--csv"],
+                capture_output=True, text=True, timeout=GROUP_TIMEOUT).stdout
+        except subprocess.TimeoutExpired:
+            print(f"      {tests}: no result within {GROUP_TIMEOUT}s, skipped", flush=True)
             continue
-        name = row["test"].split()[0]
-        rows[name] = {"rps": float(row["rps"]), "p50_ms": float(row["p50_latency_ms"]),
-                      "p99_ms": float(row["p99_latency_ms"])}
+        for row in csv.DictReader(io.StringIO(out)):
+            if "needed" in row["test"]:  # e.g. "LPUSH (needed to benchmark LRANGE)"
+                continue
+            name = row["test"].split()[0]
+            rows[name] = {"rps": float(row["rps"]), "p50_ms": float(row["p50_latency_ms"]),
+                          "p99_ms": float(row["p99_latency_ms"])}
     return rows
 
 
