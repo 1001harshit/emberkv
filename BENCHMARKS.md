@@ -36,7 +36,11 @@ the Actions tab. Run on 2026-10-23:
 - **Against other databases that can read the past** (etcd, immudb, Dolt): emberkv was the fastest
   at writes, current reads, past reads and history, and used the least disk. Dolt created
   branches faster. See [the comparison](#against-other-databases-that-can-read-the-past).
+- **Lists and sorted sets:** at pipeline 1, emberkv pushes faster than Kvrocks and Dragonfly and
+  pops a little slower. Pipelined pops are its weakest result: about 3× slower than Kvrocks.
+  Kvrocks's sorted-set tests did not finish. See [lists and sorted sets](#lists-and-sorted-sets).
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
+  A later run that added lists, sorted sets, transactions and Pub/Sub matched on 211 of 212.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
   checks passed (`--scan`, `--pipe`, stdin mode, `--latency`), and the comparison itself
   was driven through `redis-py`.
@@ -172,6 +176,51 @@ What this shows, and what it doesn't:
   - **immudb:** any revision of a key, kept forever.
   - **Dolt:** any commit.
 
+## Lists and sorted sets
+
+Measured in a later run of the same workflow, at `5633b76`. Every server ran again in that job,
+so compare rows within these two tables, not with the tables above. Each test pushes onto, or
+pops from, a single key, which is how `redis-benchmark` works.
+
+**Pipeline 1** (requests/s):
+
+| Server | LPUSH | LPOP | RPUSH | RPOP | LRANGE_100 | ZADD | ZPOPMIN |
+|---|---|---|---|---|---|---|---|
+| **emberkv (fsync everysec)** | 70,472 | 47,438 | 74,627 | 46,318 | 47,551 | 48,112 | 36,397 |
+| **emberkv (fsync always)** | 45,096 | 31,928 | 51,962 | 34,578 | 48,555 | 21,418 | 26,874 |
+| **emberkv (everysec, history off)** | 78,247 | 57,904 | 77,071 | 58,360 | 49,044 | 68,918 | 64,082 |
+| Redis (default: RDB snapshots) | 90,334 | 96,108 | 94,832 | 96,993 | 74,156 | 97,752 | 91,575 |
+| Redis (AOF everysec) | 97,371 | 96,712 | 94,922 | 94,384 | 76,046 | 99,751 | 94,206 |
+| Redis (AOF always) | 63,735 | 67,981 | 63,151 | 66,957 | 76,394 | 53,022 | 79,334 |
+| Kvrocks | 59,809 | 59,312 | 61,013 | 58,599 | 44,643 | - | - |
+| Dragonfly | 60,624 | 61,444 | 60,680 | 61,331 | 44,573 | 61,958 | 62,933 |
+
+**Pipeline 16** (requests/s):
+
+| Server | LPUSH | LPOP | RPUSH | RPOP | LRANGE_100 | ZADD | ZPOPMIN |
+|---|---|---|---|---|---|---|---|
+| **emberkv (fsync everysec)** | 103,724 | 33,831 | 121,359 | 39,970 | 48,431 | 47,601 | 167,029 |
+| **emberkv (fsync always)** | 117,467 | 24,511 | 128,833 | 23,933 | 45,608 | 40,074 | 142,086 |
+| **emberkv (everysec, history off)** | 195,046 | 61,132 | 168,748 | 67,870 | 82,720 | 53,905 | 320,308 |
+| Redis (default: RDB snapshots) | 1,287,001 | 1,146,789 | 1,360,544 | 1,236,094 | 182,083 | 535,906 | 1,362,398 |
+| Redis (AOF everysec) | 794,913 | 874,891 | 797,448 | 923,361 | 181,653 | 479,386 | 1,326,260 |
+| Redis (AOF always) | 530,786 | 604,230 | 521,648 | 611,621 | 180,018 | 374,813 | 1,215,067 |
+| Kvrocks | 145,012 | 113,559 | 157,060 | 118,483 | 65,651 | - | - |
+| Dragonfly | 446,030 | 799,360 | 479,157 | 836,120 | 107,886 | 504,796 | 851,789 |
+
+- **Kvrocks's `ZADD`/`ZPOPMIN` row is empty** because that test did not finish within the
+  harness's 5-minute limit, at either pipeline depth. emberkv had the same problem until
+  `7b3cbbd`: each pop scanned past the records of every member popped before it, so emptying a
+  set took quadratic time. The likely cause in Kvrocks is the same, RocksDB tombstones, but this
+  run doesn't prove it.
+- **Pipelined pops are emberkv's weakest result.** Each pop scans for the element at the end of
+  the list, and every pop on one key waits for that key's lock, so pipelining helps little.
+  History makes it worse: the hot key's elements keep their old versions for an hour.
+- **Same run, strings:** most string results matched earlier runs, but `SET` at pipeline 1 with
+  `fsync everysec` fell to 46k from 79k for v0.2.0. That was the first test against a freshly
+  started server, the same place as the outlier above. It needs a rerun before it can be called
+  a regression.
+
 ## Throughput, pipeline 1 (requests/s)
 
 | Server | SET | GET | INCR | HSET | SADD | MSET |
@@ -262,6 +311,8 @@ of writes, while `fsync always` loses nothing it acknowledged.
 - **Pipelined `GET` (about 490–520k/s vs Redis's 780–840k/s).** The remaining cost is checking
   the memtable and Bloom filters, decoding blocks (now with versions), and Go's per-connection
   overhead.
+- **Pipelined list pops (about 24–40k/s vs Kvrocks's 114k).** Each pop scans for its element and
+  holds the key's lock while it does, as described [above](#lists-and-sorted-sets).
 - **Keeping history**, as measured above.
 - **One database.** `SELECT` accepts only `0`, as in Redis Cluster; named branches cover the
   "separate dataset" use.
