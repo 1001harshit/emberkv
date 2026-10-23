@@ -1,0 +1,54 @@
+name: Time-travel benchmark
+
+# Compares emberkv with other databases that can read the past (etcd,
+# immudb, Dolt) using bench/timetravel. Run it from the Actions tab.
+on:
+  workflow_dispatch:
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build emberkv and the harness
+        run: |
+          go build -o bin/ ./cmd/...
+          (cd bench/timetravel && go build -o ../../bin/timetravel .)
+      - name: Start the databases (all fsync every write)
+        run: |
+          mkdir -p /tmp/tt/emberkv
+          ./bin/emberkv -addr 127.0.0.1:6380 -dir /tmp/tt/emberkv -fsync always > /tmp/tt/emberkv.log 2>&1 &
+          docker run -d --name etcd -p 2379:2379 -v etcd-data:/etcd-data gcr.io/etcd-development/etcd:v3.5.17 \
+            /usr/local/bin/etcd --data-dir /etcd-data \
+            --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://127.0.0.1:2379
+          docker run -d --name immudb -p 3322:3322 -v immudb-data:/var/lib/immudb codenotary/immudb:latest
+          docker run -d --name dolt -p 3306:3306 -e DOLT_ROOT_PASSWORD=bench -e DOLT_ROOT_HOST=% \
+            -v dolt-data:/var/lib/dolt dolthub/dolt-sql-server:latest
+          for p in 6380 2379 3322 3306; do
+            for i in $(seq 1 60); do nc -z 127.0.0.1 $p && break; sleep 1; done
+          done
+      - name: Versions
+        run: |
+          ./bin/emberkv -version
+          docker exec etcd /usr/local/bin/etcd --version | head -1
+          docker image inspect codenotary/immudb:latest --format 'immudb {{index .Config.Labels "org.opencontainers.image.version"}} {{.Created}}'
+          docker exec dolt dolt version
+      - name: Compare
+        run: |
+          vol() { docker volume inspect -f '{{.Mountpoint}}' "$1"; }
+          ./bin/timetravel -out timetravel.json \
+            -disk "emberkv=/tmp/tt/emberkv,etcd=$(vol etcd-data),immudb=$(vol immudb-data),dolt=$(vol dolt-data)"
+      - name: Logs on failure
+        if: failure()
+        run: |
+          tail -50 /tmp/tt/emberkv.log
+          for c in etcd immudb dolt; do echo "== $c"; docker logs --tail 50 $c; done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: timetravel-results
+          path: timetravel.json
