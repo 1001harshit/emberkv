@@ -394,6 +394,13 @@ func (s *Store) Rollback(at time.Time) (int, error) {
 	return n, err
 }
 
+// WatchVersion returns a number that changes whenever key is written, for
+// WATCH. Every write to a key of any type rewrites its metadata record, so
+// the record's latest version is enough.
+func (s *Store) WatchVersion(key []byte) (uint64, error) {
+	return s.db.LatestVersion(metaKey(key))
+}
+
 // Change is one past version of a key, as reported by History.
 type Change struct {
 	At    time.Time

@@ -210,6 +210,7 @@ func (s *Store) LSet(key []byte, index int64, value []byte) error {
 			return ErrIndexOutOfRange
 		}
 		c.putElement(i, value)
+		c.save() // rewrite the metadata too, so WATCH sees the change
 		return nil
 	})
 }

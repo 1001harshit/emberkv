@@ -81,6 +81,11 @@ func init() {
 		"rollback":  {cmdRollback, 2},
 		"branch":    {cmdBranch, -2},
 		"auth":      {cmdAuth, -2},
+		"multi":     {cmdMulti, 1},
+		"exec":      {nil, 1}, // handled by Server.exec
+		"discard":   {cmdDiscard, 1},
+		"watch":     {cmdWatch, -2},
+		"unwatch":   {cmdUnwatch, 1},
 		"info":      {cmdInfo, -1},
 		"time":      {cmdTime, 1},
 		"command":   {cmdCommand, -1},

@@ -23,8 +23,9 @@ var Version = "dev"
 // Server serves Redis-protocol clients from one database.
 type Server struct {
 	st       *keyspace.Store
-	branches *Branches // nil unless EnableBranches was called
-	password string    // empty: no AUTH required
+	branches *Branches    // nil unless EnableBranches was called
+	password string       // empty: no AUTH required
+	txMu     sync.RWMutex // held shared by every command, exclusively by EXEC
 	logger   *log.Logger
 	started  time.Time
 	cursors  *cursorTable
@@ -189,6 +190,12 @@ func (s *Server) handle(conn net.Conn) {
 
 // connState is what a connection remembers between commands.
 type connState struct {
+	// MULTI/EXEC state.
+	inMulti  bool
+	txFailed bool
+	queue    [][][]byte
+	watches  []watch
+
 	authed  bool
 	branch  string
 	st      *keyspace.Store // a session on the branch's store
@@ -204,18 +211,37 @@ func (s *Server) dispatch(cs *connState, w *resp.Writer, args [][]byte) (quit bo
 	cmd, ok := commands[name]
 	if !ok {
 		w.WriteError(unknownCommandError(args))
+		cs.failTx()
 		return false
 	}
 	if !cmd.arityOK(len(args)) {
 		w.WriteError("ERR wrong number of arguments for '" + name + "' command")
+		cs.failTx()
 		return false
 	}
 	// Same order as Redis: unknown commands and bad arity are reported
 	// before authentication is checked.
 	if s.password != "" && !cs.authed && !noAuthCommands[name] {
 		w.WriteError("NOAUTH Authentication required.")
+		cs.failTx()
 		return false
 	}
+	if cs.inMulti && !txControl[name] {
+		cs.queue = append(cs.queue, args)
+		w.WriteSimple("QUEUED")
+		return false
+	}
+	if name == "exec" {
+		return s.exec(cs, w) // takes txMu exclusively
+	}
+	// Every command shares txMu, so EXEC, which holds it exclusively, runs
+	// a transaction without any other command interleaving.
+	s.txMu.RLock()
+	defer s.txMu.RUnlock()
+	return s.run(cs, w, cmd, args)
+}
+
+func (s *Server) run(cs *connState, w *resp.Writer, cmd command, args [][]byte) (quit bool) {
 	c := &ctx{s: s, st: cs.st, conn: cs, w: w, args: args}
 	cmd.fn(c)
 	return c.quit

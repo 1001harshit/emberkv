@@ -820,6 +820,17 @@ func (db *DB) lookup(key []byte, asOf uint64) (base.Entry, bool, error) {
 	return base.Entry{}, false, nil
 }
 
+// LatestVersion returns the version of the newest write to key, including a
+// deletion, or 0 if it was never written (within the data kept). Comparing
+// it before and after tells whether key was written in between.
+func (db *DB) LatestVersion(key []byte) (uint64, error) {
+	e, ok, err := db.lookup(key, base.MaxVersion)
+	if err != nil || !ok {
+		return 0, err
+	}
+	return e.Version, nil
+}
+
 // Get returns the value stored for key, or ErrNotFound.
 func (db *DB) Get(key []byte) ([]byte, error) {
 	item, err := db.GetItem(key)
