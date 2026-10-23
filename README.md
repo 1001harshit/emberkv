@@ -272,6 +272,20 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 
 emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.4× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
 
+### Compared with other databases that can read the past
+
+Same checked workload for all four: 100k writes, then latest reads, reads as of a checkpoint and full key histories. Every write was fsynced and every answer was verified. Details and caveats are in [BENCHMARKS.md](BENCHMARKS.md#against-other-databases-that-can-read-the-past).
+
+| | emberkv | etcd | immudb | Dolt |
+|---|---|---|---|---|
+| Writes/s | **30.6k** | 15.6k | 1.9k | 1.0k |
+| Read as of the past/s | **54.8k** | 19.8k | 13.4k | 4.6k |
+| Full key history/s | **41.1k** | 1.9k | 11.4k | 2.1k |
+| Create a branch | 8.5 ms | — | — | **1.8 ms** |
+| Disk | **3.4 MiB** | 138 MiB | 60 MiB | 1,484 MiB |
+
+These are different kinds of database. etcd adds Raft consensus, immudb adds tamper-proof cryptographic history, and Dolt is a full SQL database with Git-style merges. emberkv is the lightest of the four.
+
 ### On an Apple M2 Pro
 
 `emberbench` is a small `redis-benchmark`-style load generator, run with 50 clients, 64-byte values and 100k keys, on an Apple M2 Pro:

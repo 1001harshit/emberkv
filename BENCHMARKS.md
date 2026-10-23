@@ -33,6 +33,9 @@ the Actions tab. Run on 2026-10-23:
   1.6–12× pipelined.
 - **Time travel has a cost:** with the default 1 hour of history, pipelined throughput is 13–29%
   lower than before history existed. With history off, 7–21% lower (see below).
+- **Against other databases that can read the past** (etcd, immudb, Dolt): emberkv was the fastest
+  at writes, current reads, past reads and history, and used the least disk. Dolt created
+  branches faster. See [the comparison](#against-other-databases-that-can-read-the-past).
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
   checks passed (`--scan`, `--pipe`, stdin mode, `--latency`), and the comparison itself
@@ -110,6 +113,64 @@ How to read it:
 
 On an Apple M2 Pro (10 cores, `emberbench`, pipeline 16) the gains were larger:
 `fsync always` `INCR` went from 14.7k to 188k, and `GET` from 618k to 1.55M.
+
+## Against other databases that can read the past
+
+The comparisons above are with Redis-style servers. This one is with databases that can also read
+the past, which is what emberkv is for. [`bench/timetravel`](bench/timetravel) runs one *checked*
+workload against each, through each database's own client:
+
+1. 10,000 keys are written 10 times each (100,000 writes), with a checkpoint after round 5.
+2. Every key's latest value is read, and must be round 10.
+3. Every key is read as of the checkpoint, and must be round 5.
+4. The full history of 1,000 keys is fetched.
+5. A branch is created, where the database supports it.
+
+All four fsync every write (emberkv with `-fsync always`, the others by default) and get 24
+concurrent clients, since immudb rejects more than about 30. The run used the
+[Time-travel benchmark workflow](.github/workflows/timetravel-bench.yml) on one 4 vCPU GitHub
+runner on 2026-10-23. **Every database answered every check correctly** (0 errors, 0 wrong values).
+
+| | emberkv | [etcd](https://etcd.io) 3.5.17 | [immudb](https://immudb.io) 1.11.0 | [Dolt](https://www.dolthub.com) 2.6.0 |
+|---|---|---|---|---|
+| Writes/s | **30.6k** (p50 0.81 ms) | 15.6k (1.74 ms) | 1.9k (12.7 ms) | 1.0k (23.4 ms) |
+| Read latest/s | **66.0k** (0.34 ms) | 19.5k (1.14 ms) | 15.3k (1.46 ms) | 5.3k (4.22 ms) |
+| Read as of the checkpoint/s | **54.8k** (0.40 ms) | 19.8k (1.12 ms) | 13.4k (1.64 ms) | 4.6k (4.64 ms) |
+| Full history of a key/s | **41.1k** (0.54 ms) | 1.9k (12.4 ms)¹ | 11.4k (1.92 ms) | 2.1k (9.06 ms)² |
+| Versions per key kept | 10 (every write) | 10 (every write) | 10 (every write) | 2 (commits only)² |
+| Create a branch | 8.5 ms | not supported | not supported | **1.8 ms** |
+| Disk after the run | **3.4 MiB** | 138 MiB³ | 60 MiB | 1,484 MiB⁴ |
+
+**Notes:**
+
+1. etcd has no history call. Its history was walked one `Get` per version, going back through
+   `ModRevision - 1`.
+2. Dolt keeps history only at Dolt commits (`CALL DOLT_COMMIT`), not at every write. This run made
+   two of them, at the checkpoint and at the end.
+3. Part of etcd's size is space its storage engine allocates ahead of use.
+4. Measured before running `dolt gc`.
+
+What this shows, and what it doesn't:
+
+- **emberkv is the fastest at every per-key operation here:** 2× etcd on writes and about 3× on
+  reads, past or present, and well ahead of immudb and Dolt. It also used the least disk.
+- **Dolt creates branches faster:** a Dolt branch is a pointer to a commit. An emberkv branch
+  first flushes the memtable to disk and then hard-links the files.
+- **They are not the same kind of database, so the numbers measure different jobs:**
+  - **etcd** replicates every write through Raft consensus, even on a single node, so it can run
+    as a fault-tolerant cluster. emberkv can't.
+  - **immudb** makes its history tamper-proof with cryptographic proofs. This benchmark used its
+    plain (unverified) reads and writes, but it still pays for maintaining the proof structures.
+  - **Dolt** is a full SQL database with Git-style commits, diffs and merges, and every operation
+    here went through SQL.
+
+  emberkv is the lightest of the four. That is why it's fast, and also why it doesn't offer those
+  guarantees.
+- **Reading the past works differently in each:**
+  - **emberkv:** any point in time inside its `-history` window.
+  - **etcd:** any revision until it is compacted.
+  - **immudb:** any revision of a key, kept forever.
+  - **Dolt:** any commit.
 
 ## Throughput, pipeline 1 (requests/s)
 
