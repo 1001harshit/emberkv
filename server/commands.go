@@ -86,8 +86,10 @@ func init() {
 		"client":    {cmdClient, -2},
 		"config":    {cmdConfig, -2},
 	}
-	for name, cmd := range containerCommands {
-		commands[name] = cmd
+	for _, group := range []map[string]command{containerCommands, listCommands, zsetCommands} {
+		for name, cmd := range group {
+			commands[name] = cmd
+		}
 	}
 }
 
@@ -121,7 +123,8 @@ func (c *ctx) fail(err error) {
 		return
 	}
 	// These keyspace errors already carry their Redis error code.
-	for _, e := range []error{keyspace.ErrWrongType, keyspace.ErrNotInteger, keyspace.ErrOverflow, keyspace.ErrReadOnly} {
+	for _, e := range []error{keyspace.ErrWrongType, keyspace.ErrNotInteger, keyspace.ErrOverflow, keyspace.ErrReadOnly,
+		keyspace.ErrNoSuchKey, keyspace.ErrIndexOutOfRange, keyspace.ErrNaN} {
 		if errors.Is(err, e) {
 			c.w.WriteError(e.Error())
 			return

@@ -223,6 +223,9 @@ func (w *Writer) WriteBulkString(s string) {
 // WriteNull writes a null bulk string.
 func (w *Writer) WriteNull() { w.bw.WriteString("$-1\r\n") }
 
+// WriteNullArray writes a null array, RESP2's "no result" for array replies.
+func (w *Writer) WriteNullArray() { w.bw.WriteString("*-1\r\n") }
+
 // WriteArray writes an array header; the caller then writes n elements.
 func (w *Writer) WriteArray(n int) { w.prefixed('*', int64(n)) }
 

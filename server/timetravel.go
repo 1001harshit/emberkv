@@ -16,6 +16,9 @@ var readCommands = map[string]bool{
 	"hexists": true, "hstrlen": true,
 	"smembers": true, "sismember": true, "smismember": true, "scard": true,
 	"sinter": true, "sunion": true, "sdiff": true,
+	"llen": true, "lrange": true, "lindex": true,
+	"zscore": true, "zmscore": true, "zcard": true, "zcount": true, "zrank": true, "zrevrank": true,
+	"zrange": true, "zrevrange": true, "zrangebyscore": true, "zrevrangebyscore": true,
 }
 
 // parseTime reads a point in time as one of:

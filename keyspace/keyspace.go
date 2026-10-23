@@ -5,10 +5,20 @@
 //
 //	'm' | key  →  type(1) | payload            (expiry lives on the record)
 //
-// For a string the payload is the value itself. For a hash or set it is
-// version(8) | size(8), and each field or member is a separate record:
+// For a string the payload is the value itself. For a hash, set, list or
+// sorted set it starts with version(8) | size(8), and each field, member or
+// element is a separate record:
 //
-//	'f' | len(key)(4) | key | version(8) | field  →  value (hash) or "" (set)
+//	'f' | len(key)(4) | key | version(8) | field     →  value (hash), "" (set)
+//	'f' | len(key)(4) | key | version(8) | index(8)  →  element (list)
+//	'f' | len(key)(4) | key | version(8) | member    →  score (sorted set)
+//	'z' | len(key)(4) | key | version(8) | score(8) | member  →  "" (sorted set)
+//
+// A list's metadata also holds head(8) | tail(8): its elements occupy
+// indexes [head, tail), starting from the middle of the uint64 range so it
+// can grow at both ends. A sorted set keeps a second record per member, in
+// the 'z' family, whose key sorts by score; scores are encoded so that byte
+// order equals numeric order. This is the Apache Kvrocks layout.
 //
 // Reading a field first reads the metadata to learn the live version, so
 // deleting, overwriting or expiring a hash of any size is one metadata write:
@@ -38,7 +48,14 @@ const (
 	TypeString Type = 1
 	TypeHash   Type = 2
 	TypeSet    Type = 3
+	TypeList   Type = 4
+	TypeZSet   Type = 5
 )
+
+// isContainer reports whether values of type t are stored as member records.
+func (t Type) isContainer() bool {
+	return t == TypeHash || t == TypeSet || t == TypeList || t == TypeZSet
+}
 
 func (t Type) String() string {
 	switch t {
@@ -48,6 +65,10 @@ func (t Type) String() string {
 		return "hash"
 	case TypeSet:
 		return "set"
+	case TypeList:
+		return "list"
+	case TypeZSet:
+		return "zset"
 	}
 	return "none"
 }
@@ -59,6 +80,7 @@ var ErrWrongType = errors.New("WRONGTYPE Operation against a key holding the wro
 const (
 	metaPrefix   = 'm'
 	memberPrefix = 'f'
+	scorePrefix  = 'z'
 )
 
 func metaKey(key []byte) []byte {
@@ -67,8 +89,12 @@ func metaKey(key []byte) []byte {
 
 // memberPrefixOf returns the prefix shared by every member of key at version.
 func memberPrefixOf(key []byte, version uint64) []byte {
+	return familyPrefix(memberPrefix, key, version)
+}
+
+func familyPrefix(family byte, key []byte, version uint64) []byte {
 	b := make([]byte, 0, 1+4+len(key)+8)
-	b = append(b, memberPrefix)
+	b = append(b, family)
 	b = binary.BigEndian.AppendUint32(b, uint32(len(key)))
 	b = append(b, key...)
 	return binary.BigEndian.AppendUint64(b, version)
@@ -78,9 +104,10 @@ func memberKey(key []byte, version uint64, field []byte) []byte {
 	return append(memberPrefixOf(key, version), field...)
 }
 
-// parseMemberKey splits a member record key into user key and version.
+// parseMemberKey splits a member or score record key into user key and
+// version.
 func parseMemberKey(k []byte) (key []byte, version uint64, ok bool) {
-	if len(k) < 5 || k[0] != memberPrefix {
+	if len(k) < 5 || (k[0] != memberPrefix && k[0] != scorePrefix) {
 		return nil, 0, false
 	}
 	n := int(binary.BigEndian.Uint32(k[1:5]))
@@ -92,11 +119,12 @@ func parseMemberKey(k []byte) (key []byte, version uint64, ok bool) {
 
 // meta is a decoded metadata record.
 type meta struct {
-	typ      Type
-	value    []byte // strings
-	version  uint64 // hashes and sets
-	size     int64  // hashes and sets
-	expireAt int64
+	typ        Type
+	value      []byte // strings
+	version    uint64 // containers
+	size       int64  // containers
+	head, tail uint64 // lists: elements occupy [head, tail)
+	expireAt   int64
 }
 
 func decodeMeta(item lsm.Item) (meta, error) {
@@ -108,12 +136,20 @@ func decodeMeta(item lsm.Item) (meta, error) {
 	switch m.typ {
 	case TypeString:
 		m.value = v[1:]
-	case TypeHash, TypeSet:
-		if len(v) != 17 {
+	case TypeHash, TypeSet, TypeZSet, TypeList:
+		want := 17
+		if m.typ == TypeList {
+			want = 33
+		}
+		if len(v) != want {
 			return meta{}, errors.New("keyspace: corrupt container metadata")
 		}
 		m.version = binary.BigEndian.Uint64(v[1:9])
 		m.size = int64(binary.BigEndian.Uint64(v[9:17]))
+		if m.typ == TypeList {
+			m.head = binary.BigEndian.Uint64(v[17:25])
+			m.tail = binary.BigEndian.Uint64(v[25:33])
+		}
 	default:
 		return meta{}, errors.New("keyspace: unknown type in metadata")
 	}
@@ -124,10 +160,18 @@ func (m *meta) encode() []byte {
 	if m.typ == TypeString {
 		return append([]byte{byte(TypeString)}, m.value...)
 	}
-	b := make([]byte, 17)
+	n := 17
+	if m.typ == TypeList {
+		n = 33
+	}
+	b := make([]byte, n)
 	b[0] = byte(m.typ)
 	binary.BigEndian.PutUint64(b[1:], m.version)
 	binary.BigEndian.PutUint64(b[9:], uint64(m.size))
+	if m.typ == TypeList {
+		binary.BigEndian.PutUint64(b[17:], m.head)
+		binary.BigEndian.PutUint64(b[25:], m.tail)
+	}
 	return b
 }
 
@@ -318,7 +362,7 @@ func (s *Store) isGarbage(k []byte) bool {
 		}
 		visible := !v.Deleted && (v.Item.ExpireAt == 0 || v.Item.ExpireAt > from.UnixMilli())
 		if visible {
-			if m, err := decodeMeta(v.Item); err == nil && (m.typ == TypeHash || m.typ == TypeSet) && m.version == gen {
+			if m, err := decodeMeta(v.Item); err == nil && m.typ.isContainer() && m.version == gen {
 				stale = false
 				return false
 			}
