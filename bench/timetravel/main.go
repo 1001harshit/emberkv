@@ -217,7 +217,9 @@ func du(path string) int64 {
 func main() {
 	keys := flag.Int("keys", 10000, "distinct keys")
 	rounds := flag.Int("rounds", 10, "times each key is written")
-	workers := flag.Int("workers", 32, "concurrent clients")
+	// immudb rejects more than about 30 concurrent requests by default, so
+	// every target gets 24 clients.
+	workers := flag.Int("workers", 24, "concurrent clients")
 	historyKeys := flag.Int("history-keys", 1000, "keys whose history is fetched")
 	targets := flag.String("targets", "emberkv,etcd,immudb,dolt", "comma-separated targets")
 	disks := flag.String("disk", "", "comma-separated target=path of each data directory")

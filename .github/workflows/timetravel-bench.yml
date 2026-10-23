@@ -35,7 +35,7 @@ jobs:
         run: |
           ./bin/emberkv -version
           docker exec etcd /usr/local/bin/etcd --version | head -1
-          docker image inspect codenotary/immudb:latest --format 'immudb {{index .Config.Labels "org.opencontainers.image.version"}} {{.Created}}'
+          docker exec immudb immudb version || docker logs immudb 2>&1 | grep -i -m1 version
           docker exec dolt dolt version
       - name: Compare
         run: |

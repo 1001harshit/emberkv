@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"regexp"
+	"sync"
 	"time"
 
 	"github.com/codenotary/immudb/pkg/api/schema"
@@ -206,10 +207,11 @@ func (t *immuTarget) Close() {
 var doltHash = regexp.MustCompile(`^[0-9a-v]{32}$`)
 
 type doltTarget struct {
-	dsn  string
-	db   *sql.DB
-	cp   string
-	done bool
+	dsn       string
+	db        *sql.DB
+	cp        string
+	finalOnce sync.Once
+	finalErr  error
 }
 
 func (t *doltTarget) Name() string { return "dolt" }
@@ -265,12 +267,11 @@ func (t *doltTarget) GetAtCheckpoint(ctx context.Context, _ int, k string) (stri
 	return v, err
 }
 func (t *doltTarget) History(ctx context.Context, _ int, k string) (int, error) {
-	if !t.done {
-		// Commit the final state too, so history holds two versions.
-		if _, err := t.commit(ctx, "final"); err != nil {
-			return 0, err
-		}
-		t.done = true
+	// Commit the final state too (once, whichever worker gets here first),
+	// so history holds the checkpoint and the end state.
+	t.finalOnce.Do(func() { _, t.finalErr = t.commit(ctx, "final") })
+	if t.finalErr != nil {
+		return 0, t.finalErr
 	}
 	var n int
 	err := t.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM dolt_history_kv WHERE k = ?", k).Scan(&n)
