@@ -69,6 +69,32 @@ func listRange(m *meta, start, stop int64) (uint64, uint64, bool) {
 	return m.head + uint64(start), m.head + uint64(stop), true
 }
 
+// pointReads is the most elements elementsAt fetches one key at a time.
+// Below it, point lookups beat a scan, which must open an iterator on
+// every table and read a block from each.
+const pointReads = 16
+
+// elementsAt returns the elements at absolute indexes from..to (inclusive).
+func (s *Store) elementsAt(key []byte, m *meta, from, to uint64) ([][]byte, error) {
+	if to-from >= pointReads {
+		var vals [][]byte
+		err := s.elements(key, m, from, to, func(_ uint64, v []byte) bool {
+			vals = append(vals, v)
+			return true
+		})
+		return vals, err
+	}
+	vals := make([][]byte, 0, to-from+1)
+	for i := from; i <= to; i++ {
+		item, err := s.GetItem(memberKey(key, m.version, indexBytes(i)))
+		if err != nil {
+			return nil, err // a missing element inside [head, tail) is corruption
+		}
+		vals = append(vals, item.Value)
+	}
+	return vals, nil
+}
+
 func (s *Store) allElements(key []byte, m *meta) ([][]byte, error) {
 	var out [][]byte
 	err := s.elements(key, m, m.head, m.tail-1, func(_ uint64, v []byte) bool {
@@ -175,11 +201,8 @@ func (s *Store) popFrom(c *container, left bool, count int64) ([][]byte, error) 
 	if !left {
 		from, to = c.m.tail-n, c.m.tail-1
 	}
-	var vals [][]byte
-	if err := s.elements(c.key, &c.m, from, to, func(_ uint64, v []byte) bool {
-		vals = append(vals, v)
-		return true
-	}); err != nil {
+	vals, err := s.elementsAt(c.key, &c.m, from, to)
+	if err != nil {
 		return nil, err
 	}
 	for i := from; i <= to; i++ {
