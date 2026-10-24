@@ -36,9 +36,9 @@ the Actions tab. Run on 2026-10-23:
 - **Against other databases that can read the past** (etcd, immudb, Dolt): emberkv was the fastest
   at writes, current reads, past reads and history, and used the least disk. Dolt created
   branches faster. See [the comparison](#against-other-databases-that-can-read-the-past).
-- **Lists and sorted sets:** at pipeline 1, emberkv pushes faster than Kvrocks and Dragonfly and
-  pops a little slower. Pipelined pops are its weakest result: about 3× slower than Kvrocks.
-  Kvrocks's sorted-set tests did not finish. See [lists and sorted sets](#lists-and-sorted-sets).
+- **Lists and sorted sets:** emberkv beats Kvrocks on every list test, and at pipeline 1 is close
+  to Dragonfly. Kvrocks's sorted-set tests did not finish. Pipelined `LRANGE_100` and `ZADD` are
+  the weak spots. See [lists and sorted sets](#lists-and-sorted-sets).
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
   A later run that added lists, sorted sets, transactions and Pub/Sub matched on 211 of 212.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
@@ -178,48 +178,58 @@ What this shows, and what it doesn't:
 
 ## Lists and sorted sets
 
-Measured in a later run of the same workflow, at `5633b76`. Every server ran again in that job,
-so compare rows within these two tables, not with the tables above. Each test pushes onto, or
-pops from, a single key, which is how `redis-benchmark` works.
+Measured in a later run of the same workflow, at `d7c47ff`. Every server ran again in that job,
+so compare rows within these tables, not with the tables above. Each test pushes onto, or pops
+from, a single key, which is how `redis-benchmark` works.
 
 **Pipeline 1** (requests/s):
 
 | Server | LPUSH | LPOP | RPUSH | RPOP | LRANGE_100 | ZADD | ZPOPMIN |
 |---|---|---|---|---|---|---|---|
-| **emberkv (fsync everysec)** | 70,472 | 47,438 | 74,627 | 46,318 | 47,551 | 48,112 | 36,397 |
-| **emberkv (fsync always)** | 45,096 | 31,928 | 51,962 | 34,578 | 48,555 | 21,418 | 26,874 |
-| **emberkv (everysec, history off)** | 78,247 | 57,904 | 77,071 | 58,360 | 49,044 | 68,918 | 64,082 |
-| Redis (default: RDB snapshots) | 90,334 | 96,108 | 94,832 | 96,993 | 74,156 | 97,752 | 91,575 |
-| Redis (AOF everysec) | 97,371 | 96,712 | 94,922 | 94,384 | 76,046 | 99,751 | 94,206 |
-| Redis (AOF always) | 63,735 | 67,981 | 63,151 | 66,957 | 76,394 | 53,022 | 79,334 |
-| Kvrocks | 59,809 | 59,312 | 61,013 | 58,599 | 44,643 | - | - |
-| Dragonfly | 60,624 | 61,444 | 60,680 | 61,331 | 44,573 | 61,958 | 62,933 |
+| **emberkv (fsync everysec)** | 83,963 | 84,353 | 69,493 | 65,985 | 47,870 | 57,921 | 51,854 |
+| **emberkv (fsync always)** | 46,849 | 46,948 | 44,258 | 43,365 | 44,160 | 42,265 | 54,142 |
+| **emberkv (everysec, history off)** | 97,656 | 92,980 | 96,899 | 99,354 | 50,391 | 54,705 | 59,542 |
+| Redis (default: RDB snapshots) | 124,922 | 119,760 | 122,026 | 121,729 | 84,317 | 133,422 | 124,224 |
+| Redis (AOF everysec) | 125,549 | 115,407 | 126,662 | 126,263 | 83,963 | 130,124 | 126,103 |
+| Redis (AOF always) | 59,382 | 64,288 | 61,595 | 64,412 | 86,768 | 56,054 | 85,874 |
+| Kvrocks | 56,007 | 54,069 | 61,595 | 50,646 | 39,738 | - | - |
+| Dragonfly | 76,540 | 80,128 | 72,543 | 79,777 | 44,014 | 80,548 | 80,613 |
 
 **Pipeline 16** (requests/s):
 
 | Server | LPUSH | LPOP | RPUSH | RPOP | LRANGE_100 | ZADD | ZPOPMIN |
 |---|---|---|---|---|---|---|---|
-| **emberkv (fsync everysec)** | 103,724 | 33,831 | 121,359 | 39,970 | 48,431 | 47,601 | 167,029 |
-| **emberkv (fsync always)** | 117,467 | 24,511 | 128,833 | 23,933 | 45,608 | 40,074 | 142,086 |
-| **emberkv (everysec, history off)** | 195,046 | 61,132 | 168,748 | 67,870 | 82,720 | 53,905 | 320,308 |
-| Redis (default: RDB snapshots) | 1,287,001 | 1,146,789 | 1,360,544 | 1,236,094 | 182,083 | 535,906 | 1,362,398 |
-| Redis (AOF everysec) | 794,913 | 874,891 | 797,448 | 923,361 | 181,653 | 479,386 | 1,326,260 |
-| Redis (AOF always) | 530,786 | 604,230 | 521,648 | 611,621 | 180,018 | 374,813 | 1,215,067 |
-| Kvrocks | 145,012 | 113,559 | 157,060 | 118,483 | 65,651 | - | - |
-| Dragonfly | 446,030 | 799,360 | 479,157 | 836,120 | 107,886 | 504,796 | 851,789 |
+| **emberkv (fsync everysec)** | 114,482 | 81,719 | 117,385 | 77,531 | 30,091 | 40,484 | 173,250 |
+| **emberkv (fsync always)** | 102,010 | 61,565 | 100,452 | 58,473 | 33,526 | 29,082 | 179,856 |
+| **emberkv (everysec, history off)** | 168,947 | 134,427 | 140,667 | 145,201 | 70,423 | 46,705 | 248,201 |
+| Redis (default: RDB snapshots) | 1,142,857 | 1,157,407 | 1,277,139 | 1,124,859 | 138,332 | 485,201 | 1,536,098 |
+| Redis (AOF everysec) | 693,963 | 865,801 | 673,401 | 816,326 | 138,735 | 386,399 | 1,517,451 |
+| Redis (AOF always) | 432,152 | 497,265 | 449,438 | 516,796 | 141,084 | 267,594 | 1,111,111 |
+| Kvrocks | 105,552 | 71,679 | 105,341 | 74,091 | 50,449 | - | - |
+| Dragonfly | 371,333 | 788,644 | 404,367 | 778,210 | 68,871 | 471,476 | 879,508 |
 
+**Pops before and after `d7c47ff`** (same run; "before" is `5633b76`). A pop used to find the
+elements it removes with a range scan, which opens an iterator on every table. It now looks each
+one up by key.
+
+| fsync | pipeline | LPOP | RPOP |
+|---|---|---|---|
+| everysec | 1 | 40,096 → 84,353 (+110%) | 36,697 → 65,985 (+80%) |
+| everysec | 16 | 30,214 → 81,719 (+170%) | 31,107 → 77,531 (+149%) |
+| always | 16 | 20,577 → 61,565 (+199%) | 20,932 → 58,473 (+179%) |
+
+- **Against Kvrocks**, the closest design, emberkv is now ahead on every list test at both
+  pipeline depths.
 - **Kvrocks's `ZADD`/`ZPOPMIN` row is empty** because that test did not finish within the
-  harness's 5-minute limit, at either pipeline depth. emberkv had the same problem until
-  `7b3cbbd`: each pop scanned past the records of every member popped before it, so emptying a
-  set took quadratic time. The likely cause in Kvrocks is the same, RocksDB tombstones, but this
-  run doesn't prove it.
-- **Pipelined pops are emberkv's weakest result.** Each pop scans for the element at the end of
-  the list, and every pop on one key waits for that key's lock, so pipelining helps little.
-  History makes it worse: the hot key's elements keep their old versions for an hour.
-- **Same run, strings:** most string results matched earlier runs, but `SET` at pipeline 1 with
-  `fsync everysec` fell to 46k from 79k for v0.2.0. That was the first test against a freshly
-  started server, the same place as the outlier above. It needs a rerun before it can be called
-  a regression.
+  harness's 5-minute limit, at either pipeline depth, in two runs. emberkv had the same problem
+  until `7b3cbbd`: each pop scanned past the records of every member popped before it, so
+  emptying a set took quadratic time. The likely cause in Kvrocks is the same, RocksDB
+  tombstones, but these runs don't prove it.
+- **Still weak:** pipelined `LRANGE_100` (30k/s vs Redis's 139k/s) and `ZADD` (40k vs 386k).
+  Both are on one key, so every command waits for the same key lock, and history keeps the
+  hot key's old versions for an hour.
+- **An earlier outlier is gone:** a run at `5633b76` had `SET` at pipeline 1 with `fsync
+  everysec` at 46k/s. In this run the same build did 95k/s, so it was noise.
 
 ## Throughput, pipeline 1 (requests/s)
 
@@ -311,8 +321,9 @@ of writes, while `fsync always` loses nothing it acknowledged.
 - **Pipelined `GET` (about 490–520k/s vs Redis's 780–840k/s).** The remaining cost is checking
   the memtable and Bloom filters, decoding blocks (now with versions), and Go's per-connection
   overhead.
-- **Pipelined list pops (about 24–40k/s vs Kvrocks's 114k).** Each pop scans for its element and
-  holds the key's lock while it does, as described [above](#lists-and-sorted-sets).
+- **Pipelined commands on one hot list or sorted set (`LRANGE_100` 30k/s, `ZADD` 40k/s, vs
+  Redis's 139k and 386k).** Every command on the key waits for its lock, and history keeps the
+  key's old versions, as described [above](#lists-and-sorted-sets).
 - **Keeping history**, as measured above.
 - **One database.** `SELECT` accepts only `0`, as in Redis Cluster; named branches cover the
   "separate dataset" use.

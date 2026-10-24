@@ -292,7 +292,7 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 | Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
 | Time travel and branches | **yes** | no | no | no |
 
-For lists and sorted sets at pipeline 1, emberkv pushes at 70–75k/s, ahead of Kvrocks (60k) and Dragonfly (61k), and pops at 46–47k/s, behind both (59–61k). Pipelined pops are its weakest result: about 3× slower than Kvrocks. Details are in [BENCHMARKS.md](BENCHMARKS.md#lists-and-sorted-sets).
+For lists, emberkv beats Kvrocks on every test, pipelined or not: for example 82k `LPOP`/s at pipeline 16 against Kvrocks's 72k. At pipeline 1 it is close to Dragonfly. Pipelined `LRANGE_100` and `ZADD` on one hot key are its weak spots. Details are in [BENCHMARKS.md](BENCHMARKS.md#lists-and-sorted-sets).
 
 emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.4× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
 
