@@ -1,16 +1,62 @@
 # Changelog
 
-## Unreleased
+## v0.3.0: lists, sorted sets, transactions and Pub/Sub
 
-- **Lists:** `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`/`RPOP` with count, `LLEN`, `LRANGE`, `LINDEX`, `LSET`,
-  `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`.
-- **Sorted sets:** `ZADD` (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZINCRBY`, `ZREM`, `ZSCORE`, `ZMSCORE`, `ZCARD`, `ZCOUNT`,
-  `ZRANK`, `ZREVRANK`, `ZRANGE` (`BYSCORE`/`REV`/`LIMIT`/`WITHSCORES`), `ZREVRANGE`, `ZRANGEBYSCORE`,
-  `ZREVRANGEBYSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`.
-- **Transactions:** `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. No client sees a half-applied transaction.
-- **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`. Slow subscribers are
-  disconnected rather than blocking publishers.
-- **Security:** `AUTH` with `-requirepass` / `$EMBERKV_PASSWORD`, and TLS with `-tls-cert` / `-tls-key`.
+emberkv now covers the Redis data types and features most applications use: lists, sorted sets,
+`MULTI`/`EXEC` transactions, Pub/Sub, and password and TLS security. Time travel works on all of
+them: `ASOF -5m LRANGE queue 0 -1` shows a list as it was five minutes ago, and `ROLLBACK`
+restores it.
+
+### New
+
+- **Lists:** `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`/`RPOP` with count, `LLEN`, `LRANGE`,
+  `LINDEX`, `LSET`, `LTRIM`, `LREM`, `LINSERT`, `LMOVE`, `RPOPLPUSH`.
+- **Sorted sets:** `ZADD` (`NX`/`XX`/`GT`/`LT`/`CH`/`INCR`), `ZINCRBY`, `ZREM`, `ZSCORE`,
+  `ZMSCORE`, `ZCARD`, `ZCOUNT`, `ZRANK`, `ZREVRANK`, `ZRANGE` (`BYSCORE`/`REV`/`LIMIT`/`WITHSCORES`),
+  `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZREMRANGEBYSCORE`,
+  `ZREMRANGEBYRANK`.
+- **Transactions:** `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`. No client sees a half-applied
+  transaction.
+- **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE`, `UNSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB`. A
+  subscriber too slow to keep up is disconnected rather than slowing publishers down.
+- **Security:**
+  - Passwords: `AUTH`, set with `-requirepass` or `$EMBERKV_PASSWORD`.
+  - TLS: `-tls-cert` and `-tls-key`.
+  - emberkv now warns at startup if it listens beyond localhost without a password.
+
+### Compatibility
+
+211 of 212 commands in the differential test reply byte-for-byte like Redis 7.0. The one
+difference is still `SELECT 1`: emberkv has a single database.
+
+### Performance
+
+From one run of the [Benchmark workflow](.github/workflows/bench.yml) on a 4 vCPU GitHub runner,
+`redis-benchmark` with 50 clients, every server in the same job (requests/s):
+
+| | LPUSH p1 | LPOP p1 | LPOP p16 | RPOP p16 | ZPOPMIN p16 |
+|---|---|---|---|---|---|
+| **emberkv v0.3.0** (history 1 h) | 84.0k | 84.4k | 81.7k | 77.5k | 173k |
+| Redis 7.0 (AOF everysec) | 126k | 115k | 866k | 816k | 1.52M |
+| Kvrocks | 56.0k | 54.1k | 71.7k | 74.1k | did not finish |
+| Dragonfly | 76.5k | 80.1k | 789k | 778k | 880k |
+
+- **Kvrocks**, the closest design, is behind emberkv on every list test. Its sorted-set test did
+  not finish within 5 minutes, in two runs.
+- **Redis and Dragonfly**, both in memory, are far ahead when pipelined.
+- **Weak spots:** pipelined `LRANGE_100` and `ZADD` on one hot key (30k/s and 40k/s), and
+  `ZPOPMAX`, which reads the whole set.
+- **Full tables:** [BENCHMARKS.md](BENCHMARKS.md#lists-and-sorted-sets).
+
+### Fixed
+
+- **Emptying a large list or sorted set took quadratic time**, because each pop stepped over
+  everything earlier pops had deleted. It is linear now, with a test that checks it.
+- **Pops are 2–3× faster:** they look elements up by key instead of scanning for them.
+
+### Upgrading
+
+The on-disk format is unchanged: v0.3.0 opens data directories written by v0.2.0.
 
 ## v0.2.0: time travel and branches
 
