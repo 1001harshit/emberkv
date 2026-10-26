@@ -30,6 +30,8 @@ type Server struct {
 	started  time.Time
 	cursors  *cursorTable
 	pubsub   *hub
+	blocked  *blockers
+	quit     chan struct{} // closed by Close, to release blocked clients
 
 	mu     sync.Mutex
 	ln     net.Listener
@@ -52,6 +54,8 @@ func New(st *keyspace.Store, logger *log.Logger) *Server {
 		started: time.Now(),
 		cursors: newCursorTable(4096),
 		pubsub:  newHub(),
+		blocked: newBlockers(),
+		quit:    make(chan struct{}),
 		conns:   make(map[net.Conn]struct{}),
 	}
 }
@@ -120,6 +124,9 @@ func (s *Server) Addr() net.Addr {
 // handlers to return. It does not close the database.
 func (s *Server) Close() error {
 	s.mu.Lock()
+	if !s.closed {
+		close(s.quit)
+	}
 	s.closed = true
 	var err error
 	if s.ln != nil {
@@ -176,7 +183,8 @@ func (s *Server) handle(conn net.Conn) {
 		quit := s.dispatch(cs, w, args)
 		// Reply only when no pipelined commands are waiting, so a pipeline of
 		// N commands costs one log write and one network write instead of N.
-		if quit || r.Buffered() == 0 {
+		// A command that blocks sends the replies before it first.
+		if quit || r.Buffered() == 0 || cs.blocked != nil {
 			if err := pending.Wait(); err != nil {
 				cs.wmu.Unlock()
 				// The writes may not be durable: drop the connection rather
@@ -193,6 +201,9 @@ func (s *Server) handle(conn net.Conn) {
 		if quit {
 			return
 		}
+		if cs.blocked != nil && !s.wait(cs, r) {
+			return
+		}
 	}
 }
 
@@ -205,6 +216,14 @@ type connState struct {
 	watches  []watch
 
 	authed bool
+
+	// Blocking commands: the waiter this connection is parked on after its
+	// command returns, and the keys its commands added elements to, whose
+	// waiters are served once the command (or EXEC) finishes.
+	blocked    *waiter
+	toWake     [][]byte
+	wakeBranch bool
+	inExec     bool
 
 	// Pub/Sub: the connection and its writer, guarded by wmu, and the
 	// subscription state once it subscribes.
@@ -257,7 +276,9 @@ func (s *Server) dispatch(cs *connState, w *resp.Writer, args [][]byte) (quit bo
 	// a transaction without any other command interleaving.
 	s.txMu.RLock()
 	defer s.txMu.RUnlock()
-	return s.run(cs, w, cmd, args)
+	quit = s.run(cs, w, cmd, args)
+	s.runWakes(cs)
+	return quit
 }
 
 func (s *Server) run(cs *connState, w *resp.Writer, cmd command, args [][]byte) (quit bool) {

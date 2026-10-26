@@ -98,7 +98,7 @@ func init() {
 		"client":       {cmdClient, -2},
 		"config":       {cmdConfig, -2},
 	}
-	for _, group := range []map[string]command{containerCommands, listCommands, zsetCommands} {
+	for _, group := range []map[string]command{containerCommands, listCommands, blockingCommands, zsetCommands} {
 		for name, cmd := range group {
 			commands[name] = cmd
 		}
@@ -798,6 +798,7 @@ func cmdInfo(c *ctx) {
 	if want("clients") {
 		line("# Clients")
 		line("connected_clients:%d", c.s.clientCount())
+		line("blocked_clients:%d", c.s.blocked.count())
 		line("")
 	}
 	if want("stats") {

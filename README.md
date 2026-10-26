@@ -83,6 +83,7 @@ Every write is stored as a new **version** with a timestamp, and versions are ke
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
 - **Strings, hashes, sets, lists and sorted sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field, member or element. Deleting or expiring a collection of any size is a single write, and a compaction filter later reclaims the orphaned records.
 - **Transactions:** `MULTI`/`EXEC`/`DISCARD` with optimistic locking through `WATCH`. No other client sees or interleaves with a half-applied transaction.
+- **Blocking list commands:** `BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH` for job queues. Waiting clients are served in the order they blocked, as in Redis, and a push reaches a waiting consumer in well under a millisecond.
 - **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE` (glob patterns) and `PUBLISH`, with slow subscribers disconnected instead of blocking publishers.
 - **Security:** `AUTH` with `-requirepass`, and TLS with `-tls-cert`/`-tls-key`.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
@@ -244,7 +245,7 @@ Format 2 added versions. A data directory written by v0.1.0 (format 1) is refuse
 | Strings | `GET` `SET [NX\|XX] [GET] [EX\|PX\|EXAT\|PXAT\|KEEPTTL]` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `MGET` `MSET` `APPEND` `STRLEN` |
 | Counters | `INCR` `DECR` `INCRBY` `DECRBY` |
 | Keys | `DEL` `UNLINK` `EXISTS` `TYPE` `KEYS` `SCAN [MATCH] [COUNT] [TYPE]` `DBSIZE` `FLUSHDB` `FLUSHALL` |
-| Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP [count]` `RPOP [count]` `LLEN` `LRANGE` `LINDEX` `LSET` `LTRIM` `LREM` `LINSERT` `LMOVE` `RPOPLPUSH` |
+| Lists | `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP [count]` `RPOP [count]` `LLEN` `LRANGE` `LINDEX` `LSET` `LTRIM` `LREM` `LINSERT` `LMOVE` `RPOPLPUSH` `BLPOP` `BRPOP` `BLMOVE` `BRPOPLPUSH` |
 | Sorted sets | `ZADD [NX\|XX] [GT\|LT] [CH] [INCR]` `ZINCRBY` `ZREM` `ZSCORE` `ZMSCORE` `ZCARD` `ZCOUNT` `ZRANK` `ZREVRANK` `ZRANGE [BYSCORE] [REV] [LIMIT] [WITHSCORES]` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZPOPMIN` `ZPOPMAX` `ZREMRANGEBYSCORE` `ZREMRANGEBYRANK` |
 | Transactions | `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` |
 | Pub/Sub | `SUBSCRIBE` `PSUBSCRIBE` `UNSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB CHANNELS\|NUMSUB\|NUMPAT` |
@@ -259,7 +260,7 @@ Format 2 added versions. A data directory written by v0.1.0 (format 1) is refuse
 Strings, hashes, sets, lists and sorted sets are supported, with Redis's `WRONGTYPE` errors.
 
 Not supported yet:
-- **Commands:** blocking list commands (`BLPOP`…), `ZRANGE … BYLEX`, set-operation `STORE` variants.
+- **Commands:** `BLMPOP`, `BZPOPMIN`/`BZPOPMAX`, `ZRANGE … BYLEX`, set-operation `STORE` variants.
 - **Types:** streams, bitmaps, HyperLogLog, geo.
 - **Scripting:** Lua.
 - **Databases:** there is a single database; `SELECT` accepts only `0`, as in Redis Cluster.
@@ -349,7 +350,7 @@ Effect of group commit on writes (pipeline 1):
 - [ ] Key-prefix compression inside blocks
 - [ ] Replication via WAL shipping
 - [x] `AUTH` and TLS
-- [ ] Blocking list commands (`BLPOP`, `BRPOP`, `BLMOVE`)
+- [x] Blocking list commands (`BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`)
 - [ ] Streams
 - [x] Release builds for Linux, macOS and Windows, a Homebrew tap, a curl installer and a Docker image
 

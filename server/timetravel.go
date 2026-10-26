@@ -139,4 +139,5 @@ func cmdRollback(c *ctx) {
 		return
 	}
 	c.w.WriteInt(int64(n))
+	c.wakeAll() // any list may have come back
 }

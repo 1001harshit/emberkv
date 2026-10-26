@@ -41,6 +41,13 @@ func NewReader(r io.Reader) *Reader {
 // pipelined commands.
 func (r *Reader) Buffered() int { return r.br.Buffered() }
 
+// WaitReadable blocks until at least one byte can be read, without
+// consuming it, and returns the read error if the connection fails first.
+func (r *Reader) WaitReadable() error {
+	_, err := r.br.Peek(1)
+	return err
+}
+
 func (r *Reader) readLine() ([]byte, error) {
 	line, err := r.br.ReadSlice('\n')
 	if errors.Is(err, bufio.ErrBufferFull) {

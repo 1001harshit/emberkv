@@ -69,6 +69,20 @@ func TestTLS(t *testing.T) {
 	c.expect("OK", "SET", "secure", "yes")
 	c.expect("yes", "GET", "secure")
 
+	// Blocking stops reading with a read deadline; the TLS session must
+	// survive it.
+	conn2, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: pool, ServerName: "localhost"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	pusher := &client{t: t, conn: conn2, r: resp.NewReader(conn2), w: resp.NewWriter(conn2)}
+	c.send("BLPOP", "q", "0")
+	pusher.waitBlocked(1)
+	pusher.do("RPUSH", "q", "x")
+	c.expectNext(list("q", "x"))
+	c.expect("PONG", "PING")
+
 	// A plaintext client gets no service from a TLS listener.
 	plain, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {

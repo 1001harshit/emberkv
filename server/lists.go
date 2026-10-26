@@ -32,6 +32,9 @@ func cmdPush(left, onlyIfExists bool) func(*ctx) {
 			return
 		}
 		c.w.WriteInt(n)
+		if n > 0 {
+			c.wake(c.args[1])
+		}
 	}
 }
 
@@ -193,6 +196,7 @@ func (c *ctx) move(src, dst []byte, fromLeft, toLeft bool) {
 		c.w.WriteNull()
 	default:
 		c.w.WriteBulk(v)
+		c.wake(dst)
 	}
 }
 

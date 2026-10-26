@@ -95,10 +95,13 @@ func (s *Server) exec(cs *connState, w *resp.Writer) (quit bool) {
 		}
 	}
 	w.WriteArray(len(queue))
+	cs.inExec = true
 	for _, args := range queue {
 		if s.run(cs, w, commands[strings.ToLower(string(args[0]))], args) {
 			quit = true
 		}
 	}
+	cs.inExec = false
+	s.runWakes(cs) // still holding txMu: waiters are served after the transaction, not inside it
 	return quit
 }

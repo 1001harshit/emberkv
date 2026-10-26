@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Blocking list commands:** `BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH`, with Redis's semantics:
+  - Clients blocked on a key are served oldest first.
+  - Inside `MULTI`/`EXEC` they never block, and waiters are served only after `EXEC`, so a
+    transaction sees its own pushes.
+  - A client that disconnects while blocked takes nothing with it.
+  - `ROLLBACK` wakes clients whose lists it brings back.
+  - `INFO clients` reports `blocked_clients`.
+- **`emberbench -t queue,wake`** benchmarks a `BLPOP` job queue on any Redis-protocol server:
+  throughput, and how fast a push reaches a consumer that is already waiting.
+
 ## v0.3.0: lists, sorted sets, transactions and Pub/Sub
 
 emberkv now covers the Redis data types and features most applications use: lists, sorted sets,
