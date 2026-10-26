@@ -17,6 +17,7 @@ import io
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -239,6 +240,11 @@ COMPAT = [
     ["LSET", "L", "50", "s"], ["LSET", "nolist", "0", "s"], ["LTRIM", "L", "1", "-1"], ["LRANGE", "L", "0", "-1"],
     ["RPOPLPUSH", "L", "L2"], ["LMOVE", "L", "L2", "LEFT", "LEFT"], ["LRANGE", "L2", "0", "-1"], ["TYPE", "L2"],
     ["LPUSHX", "nolist", "a"], ["RPUSHX", "L2", "e"], ["LPOP", "L", "-1"], ["LPOP", "L2", "0"],
+    # Blocking pops that find an element or time out at once, with their argument errors.
+    ["RPUSH", "BQ", "a", "b", "c"], ["BLPOP", "nolist", "BQ", "0"], ["BRPOP", "BQ", "0.01"],
+    ["BLMOVE", "BQ", "BQ2", "LEFT", "RIGHT", "0"], ["BRPOPLPUSH", "BQ2", "BQ", "0"], ["LRANGE", "BQ", "0", "-1"],
+    ["BLPOP", "nolist", "0.01"], ["BLMOVE", "nolist", "BQ", "LEFT", "LEFT", "0.01"], ["BLPOP", "BQ", "-1"],
+    ["BLPOP", "BQ", "soon"], ["BLMOVE", "BQ", "BQ2", "UP", "LEFT", "0"], ["SET", "BS", "x"], ["BLPOP", "BS", "0"],
     # sorted sets
     ["ZADD", "Z", "1", "a", "2", "b", "2", "c", "-1.5", "d"], ["ZADD", "Z", "XX", "CH", "5", "a", "9", "nope"],
     ["ZADD", "Z", "INCR", "0.5", "b"], ["ZADD", "Z", "NX", "INCR", "1", "a"], ["ZADD", "Z", "GT", "1", "a"],
@@ -258,7 +264,9 @@ COMPAT = [
 
 
 def run_compat(port):
-    r = redis.Redis(port=port, decode_responses=True)
+    # The timeout turns a command that blocks by mistake into a reported
+    # difference instead of a stuck run.
+    r = redis.Redis(port=port, decode_responses=True, socket_timeout=10)
     r.response_callbacks.clear()  # compare raw protocol replies
     r.execute_command("FLUSHALL")
     out = []
@@ -267,6 +275,8 @@ def run_compat(port):
             res = r.execute_command(*cmd)
         except redis.ResponseError as e:
             res = f"(error) {e}"
+        except redis.TimeoutError:
+            res = "(no reply within 10 s)"
         if cmd[0] in UNORDERED and isinstance(res, list):
             res = sorted(res, key=str)
         elif cmd[0] == "HGETALL" and isinstance(res, list):
@@ -335,6 +345,36 @@ def bench(port, pipeline, n):
             name = row["test"].split()[0]
             rows[name] = {"rps": float(row["rps"]), "p50_ms": float(row["p50_latency_ms"]),
                           "p99_ms": float(row["p99_latency_ms"])}
+    return rows
+
+
+# ---------------------------------------------------------- blocking queue
+
+def parse_duration_ms(s):
+    for unit, scale in (("ms", 1), ("µs", 1e-3), ("us", 1e-3), ("ns", 1e-6), ("s", 1e3)):
+        if s.endswith(unit):
+            return float(s[: -len(unit)]) * scale
+    return float(s) * 1e3
+
+
+def queue_bench(emberbench, port):
+    """BLPOP consumers and RPUSH producers through emberbench, which
+    redis-benchmark cannot do: throughput with the clients split in half,
+    and push-to-delivery latency with one producer and 49 blocked consumers."""
+    try:
+        out = subprocess.run([emberbench, "-addr", f"127.0.0.1:{port}", "-c", "50", "-n", "100000",
+                              "-t", "queue,wake"], capture_output=True, text=True, timeout=GROUP_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"      no result within {GROUP_TIMEOUT}s, skipped", flush=True)
+        return {}
+    rows = {}
+    for line in out.stdout.splitlines():
+        m = re.match(r"(QUEUE|WAKE)\s+\d+ items\s+([\d.]+) items/sec\s+handoff p50 (\S+)\s+p99 (\S+)", line)
+        if m:
+            rows[m.group(1).lower()] = {"ips": float(m.group(2)), "p50_ms": parse_duration_ms(m.group(3)),
+                                        "p99_ms": parse_duration_ms(m.group(4))}
+    if not rows:
+        print(f"      failed: {out.stderr.strip()[-300:]}", flush=True)
     return rows
 
 
@@ -442,6 +482,18 @@ def report(res):
             for n in ("SET", "GET", "HSET")) + " |")
     w("")
 
+    if res.get("queue"):
+        w("## Blocking list queue (`BLPOP`)\n")
+        w("A job queue on one list, driven by `emberbench`. **Queue:** 25 clients `RPUSH`, 25 take items "
+          "with `BLPOP`. **Wake:** 1 client pushes, 49 wait in `BLPOP`, so nearly every item goes to a "
+          "client that was already blocked; its latency is push-to-delivery.\n")
+        w("| Server | Queue items/s | Wake p50 ms | Wake p99 ms |\n|---|---|---|---|")
+        for key, q in res["queue"].items():
+            cells = [f"{q['queue']['ips']:,.0f}" if "queue" in q else "-"]
+            cells += [f"{q['wake'][f]:.3f}" if "wake" in q else "-" for f in ("p50_ms", "p99_ms")]
+            w(f"| {res['labels'][key]} | " + " | ".join(cells) + " |")
+        w("")
+
     w("## Memory and disk after loading the same data\n\n1,000,000 random `SET`s with 100-byte values.\n")
     w("| Server | Keys | Memory (RSS) | Disk |\n|---|---|---|---|")
     for key, f in res["footprint"].items():
@@ -462,11 +514,13 @@ def report(res):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--emberkv", required=True)
+    ap.add_argument("--emberbench", help="emberbench binary; default: next to --emberkv")
     ap.add_argument("--out", default="results")
     ap.add_argument("--work", default="/tmp/emberkv-bench")
     ap.add_argument("--baseline", help="an older emberkv binary to benchmark alongside")
     ap.add_argument("--baseline-name", default="baseline", help="label for the baseline in the report")
     args = ap.parse_args()
+    args.emberbench = os.path.abspath(args.emberbench or os.path.join(os.path.dirname(args.emberkv), "emberbench"))
 
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.out, exist_ok=True)
@@ -502,6 +556,14 @@ def main():
             for p, n in (("1", 200000), ("16", 1000000)):
                 print(f"   {s.name} P={p}", flush=True)
                 res["throughput"][p][key] = bench(s.port, int(p), n)
+
+        print("== blocking queue", flush=True)
+        res["queue"] = {}
+        for key, s in servers.items():
+            if key.startswith("ember-old"):  # older builds may lack blocking commands
+                continue
+            print(f"   {s.name}", flush=True)
+            res["queue"][key] = queue_bench(args.emberbench, s.port)
 
         print("== memory and disk", flush=True)
         for s in servers.values():
