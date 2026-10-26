@@ -290,6 +290,11 @@ def compat(servers):
     got = run_compat(servers["ember-es"].port)
     diffs = []
     for cmd, w, g in zip(COMPAT, want, got):
+        # A TTL counts down, and the two servers run the list a moment
+        # apart, so allow one unit of drift.
+        if cmd[0] in ("TTL", "PTTL") and isinstance(w, int) and isinstance(g, int) and w > 0 and g > 0 \
+                and abs(w - g) <= (1 if cmd[0] == "TTL" else 1000):
+            continue
         if w != g:
             diffs.append({"command": " ".join(cmd), "redis": repr(w), "emberkv": repr(g)})
     return {"total": len(COMPAT), "same": len(COMPAT) - len(diffs), "diffs": diffs}

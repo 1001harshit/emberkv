@@ -83,7 +83,7 @@ Every write is stored as a new **version** with a timestamp, and versions are ke
 - **Background compaction.** Uses RocksDB-style "universal" compaction with size-ratio and space-amplification triggers. It reclaims overwritten, deleted and expired data.
 - **Strings, hashes, sets, lists and sorted sets** on one LSM keyspace, using the Kvrocks design: a metadata record per key plus one record per field, member or element. Deleting or expiring a collection of any size is a single write, and a compaction filter later reclaims the orphaned records.
 - **Transactions:** `MULTI`/`EXEC`/`DISCARD` with optimistic locking through `WATCH`. No other client sees or interleaves with a half-applied transaction.
-- **Blocking list commands:** `BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH` for job queues. Waiting clients are served in the order they blocked, as in Redis, and a push reaches a waiting consumer in well under a millisecond.
+- **Blocking list commands:** `BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH` for job queues. Waiting clients are served in the order they blocked, as in Redis. In the benchmark a queue moved as many items as Redis and 3× as many as Kvrocks, and a push reached a waiting consumer in 0.13 ms (median).
 - **Pub/Sub:** `SUBSCRIBE`, `PSUBSCRIBE` (glob patterns) and `PUBLISH`, with slow subscribers disconnected instead of blocking publishers.
 - **Security:** `AUTH` with `-requirepass`, and TLS with `-tls-cert`/`-tls-key`.
 - **TTLs.** `EX` / `PX` / `EXAT` / `PXAT` / `KEEPTTL`, `EXPIRE`, `TTL` and `PERSIST`. Expiry is stored with each record and survives restarts.
@@ -294,6 +294,8 @@ From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub
 | Time travel and branches | **yes** | no | no | no |
 
 For lists, emberkv beats Kvrocks on every test, pipelined or not: for example 82k `LPOP`/s at pipeline 16 against Kvrocks's 72k. At pipeline 1 it is close to Dragonfly. Pipelined `LRANGE_100` and `ZADD` on one hot key are its weak spots. Details are in [BENCHMARKS.md](BENCHMARKS.md#lists-and-sorted-sets).
+
+As a `BLPOP` job queue, emberkv moved 25k items/s, the same as Redis and 3× Kvrocks. A push reached a waiting consumer in 0.13 ms at the median, against Redis's 0.08 ms; at p99 it was 5.9 ms against 0.2 ms. Details are in [BENCHMARKS.md](BENCHMARKS.md#blocking-list-queue-blpop).
 
 emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.4× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
 

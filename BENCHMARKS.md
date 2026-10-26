@@ -36,11 +36,15 @@ the Actions tab. Run on 2026-10-23:
 - **Against other databases that can read the past** (etcd, immudb, Dolt): emberkv was the fastest
   at writes, current reads, past reads and history, and used the least disk. Dolt created
   branches faster. See [the comparison](#against-other-databases-that-can-read-the-past).
+- **Blocking queue (`BLPOP`):** emberkv moved as many items as Redis and 3× as many as Kvrocks.
+  A push reached a waiting consumer in 0.13 ms typically, but the p99 was 5.9 ms against Redis's
+  0.2 ms. See [the queue test](#blocking-list-queue-blpop).
 - **Lists and sorted sets:** emberkv beats Kvrocks on every list test, and at pipeline 1 is close
   to Dragonfly. Kvrocks's sorted-set tests did not finish. Pipelined `LRANGE_100` and `ZADD` are
   the weak spots. See [lists and sorted sets](#lists-and-sorted-sets).
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
-  A later run that added lists, sorted sets, transactions and Pub/Sub matched on 211 of 212.
+  A later run that added lists, sorted sets, transactions, Pub/Sub and blocking commands matched
+  on 223 of 225. The second difference was a TTL read a second later; the harness now allows that.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
   checks passed (`--scan`, `--pipe`, stdin mode, `--latency`), and the comparison itself
   was driven through `redis-py`.
@@ -231,6 +235,37 @@ one up by key.
 - **An earlier outlier is gone:** a run at `5633b76` had `SET` at pipeline 1 with `fsync
   everysec` at 46k/s. In this run the same build did 95k/s, so it was noise.
 
+## Blocking list queue (`BLPOP`)
+
+`redis-benchmark` has no blocking tests, so this one is driven by
+[`emberbench`](cmd/emberbench/main.go) `-t queue,wake`, in a later run of the same workflow at
+`8528761`. Compare rows within this table only.
+
+- **Queue:** 25 clients push with `RPUSH` while 25 take items with `BLPOP`, 100k items in all.
+- **Wake:** 1 client pushes and 49 wait in `BLPOP`, so nearly every item is handed to a client
+  that was already blocked. The latency is from push to delivery.
+
+| Server | Queue items/s | Wake p50 ms | Wake p99 ms |
+|---|---|---|---|
+| **emberkv (fsync everysec)** | 25,136 | 0.134 | 5.917 |
+| **emberkv (fsync always)** | 12,052 | 0.424 | 5.378 |
+| **emberkv (everysec, history off)** | 20,064 | 0.148 | 2.247 |
+| Redis (default: RDB snapshots) | 25,898 | 0.073 | 0.207 |
+| Redis (AOF everysec) | 24,954 | 0.080 | 0.196 |
+| Redis (AOF always) | 16,845 | 0.343 | 2.354 |
+| Kvrocks | 8,338 | 0.548 | 24.397 |
+| Dragonfly | 10,533 | 0.312 | 4.193 |
+
+- **Throughput:** emberkv moved as many items as Redis and **3× as many as Kvrocks**. With one
+  list and blocking round trips, the clients rather than the servers set most of the pace.
+- **Typical latency:** a push reached a waiting consumer in 0.13 ms, about 1.7× Redis's 0.08 ms
+  and 4× faster than Kvrocks.
+- **Tail latency is the weak spot:** p99 was 5.9 ms against Redis's 0.2 ms.
+- **The history-off row** came out lower than the default in this one run. Nothing in that path
+  depends on history, so treat the gap as noise until a rerun says otherwise.
+- **The same run's string results** were 0–12% below the `v0.3.0` build. A local A/B of the two
+  builds, alternating three times, showed no difference, so this was runner noise.
+
 ## Throughput, pipeline 1 (requests/s)
 
 | Server | SET | GET | INCR | HSET | SADD | MSET |
@@ -324,6 +359,8 @@ of writes, while `fsync always` loses nothing it acknowledged.
 - **Pipelined commands on one hot list or sorted set (`LRANGE_100` 30k/s, `ZADD` 40k/s, vs
   Redis's 139k and 386k).** Every command on the key waits for its lock, and history keeps the
   key's old versions, as described [above](#lists-and-sorted-sets).
+- **Tail latency for blocked clients (p99 5.9 ms vs Redis's 0.2 ms).** The handoff runs through
+  several goroutines and a log write; see [the queue test](#blocking-list-queue-blpop).
 - **Keeping history**, as measured above.
 - **One database.** `SELECT` accepts only `0`, as in Redis Cluster; named branches cover the
   "separate dataset" use.
