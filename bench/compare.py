@@ -565,9 +565,8 @@ def main():
         print("== blocking queue", flush=True)
         res["queue"] = {}
         for key, s in servers.items():
-            if key.startswith("ember-old"):  # older builds may lack blocking commands
-                continue
             print(f"   {s.name}", flush=True)
+            # A baseline without blocking commands just gets an empty row.
             res["queue"][key] = queue_bench(args.emberbench, s.port)
 
         print("== memory and disk", flush=True)
