@@ -253,6 +253,10 @@ COMPAT = [
     ["ZRANGE", "Z", "(5", "-inf", "BYSCORE", "REV"], ["ZCOUNT", "Z", "-inf", "(2.5"], ["ZRANK", "Z", "c"],
     ["ZREVRANK", "Z", "c"], ["ZRANK", "Z", "zz"], ["ZSCORE", "Z", "b"], ["ZSCORE", "Z", "zz"],
     ["ZMSCORE", "Z", "a", "zz"], ["ZINCRBY", "Z", "0.1", "d"], ["ZCARD", "Z"], ["ZPOPMIN", "Z"],
+    # Score formatting at fpconv's switch points between plain and scientific notation.
+    ["ZADD", "ZF", "1e7", "a", "1e8", "b", "123e10", "c", "1e21", "d", "1e22", "e", "0.0001", "f",
+     "1.5e-6", "g", "1e-7", "h", "-2.5e-5", "i", "123456789012345680", "j"],
+    ["ZRANGE", "ZF", "0", "-1", "WITHSCORES"], ["ZINCRBY", "ZF", "0.2", "a"], ["ZSCORE", "ZF", "f"],
     ["ZPOPMAX", "Z", "2"], ["ZREM", "Z", "c", "zz"], ["ZADD", "Z2", "1", "a", "2", "b", "3", "c", "4", "d"],
     ["ZREMRANGEBYRANK", "Z2", "0", "0"], ["ZREMRANGEBYSCORE", "Z2", "-inf", "(3"], ["ZRANGE", "Z2", "0", "-1"],
     ["ZADD", "Z3", "+inf", "top", "-inf", "bottom", "0", "zero"], ["ZRANGE", "Z3", "0", "-1", "WITHSCORES"],
@@ -524,6 +528,8 @@ def main():
     ap.add_argument("--work", default="/tmp/emberkv-bench")
     ap.add_argument("--baseline", help="an older emberkv binary to benchmark alongside")
     ap.add_argument("--baseline-name", default="baseline", help="label for the baseline in the report")
+    ap.add_argument("--compat-only", action="store_true",
+                    help="only diff replies against Redis: a few minutes instead of an hour")
     args = ap.parse_args()
     args.emberbench = os.path.abspath(args.emberbench or os.path.join(os.path.dirname(args.emberkv), "emberbench"))
 
@@ -531,6 +537,8 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     servers = make_servers(os.path.abspath(args.emberkv), args.work,
                            os.path.abspath(args.baseline) if args.baseline else None)
+    if args.compat_only:
+        servers = {k: servers[k] for k in ("ember-es", "redis-rdb")}
 
     def version(cmd):
         return subprocess.run(cmd, capture_output=True, text=True).stdout.strip().split("\n")[0]
@@ -553,6 +561,23 @@ def main():
         print("== compatibility", flush=True)
         res["compat"] = compat(servers)
         res["redis_cli"] = redis_cli_checks(servers["ember-es"].port)
+        if args.compat_only:
+            c = res["compat"]
+            md = f"# emberkv vs Redis: compatibility\n\n{res['versions']}\n\n**{c['same']} of {c['total']}** " \
+                 "commands returned exactly the same reply as Redis.\n\n"
+            if c["diffs"]:
+                md += "| Command | Redis | emberkv |\n|---|---|---|\n" + "".join(
+                    f"| `{d['command']}` | `{d['redis']}` | `{d['emberkv']}` |\n" for d in c["diffs"])
+            with open(os.path.join(args.out, "results.json"), "w") as f:
+                json.dump(res, f, indent=2)
+            with open(os.path.join(args.out, "report.md"), "w") as f:
+                f.write(md)
+            print(md)
+            summary = os.environ.get("GITHUB_STEP_SUMMARY")
+            if summary:
+                with open(summary, "a") as f:
+                    f.write(md)
+            return
 
         print("== throughput", flush=True)
         res["throughput"] = {"1": {}, "16": {}}

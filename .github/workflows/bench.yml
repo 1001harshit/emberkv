@@ -10,6 +10,11 @@ on:
         description: "Optional git ref of an older emberkv to benchmark alongside (e.g. v0.1.0)"
         required: false
         default: ""
+      compat_only:
+        description: "Only diff replies against Redis (a few minutes)"
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   compare:
@@ -42,14 +47,17 @@ jobs:
           sudo systemctl disable redis-server || true
           pip install redis==5.2.1
       - name: Pull Kvrocks and Dragonfly
+        if: ${{ !inputs.compat_only }}
         run: |
           docker pull -q apache/kvrocks:latest
           docker pull -q docker.dragonflydb.io/dragonflydb/dragonfly:latest
       - name: Compare
         env:
           BASELINE: ${{ inputs.baseline }}
+          COMPAT_ONLY: ${{ inputs.compat_only }}
         run: |
           args=(--emberkv bin/emberkv --out results)
+          if [ "$COMPAT_ONLY" = "true" ]; then args+=(--compat-only); fi
           if [ -n "$BASELINE" ]; then
             args+=(--baseline bin-baseline/emberkv --baseline-name "$BASELINE ($(git rev-parse --short "$BASELINE"))")
           fi
