@@ -49,14 +49,68 @@ func parseScore(b []byte) (float64, error) {
 
 // formatScore matches Redis 7.0's replies for doubles: "%.17g", with "inf"
 // and "-inf".
+// formatScore writes a score as Redis 7.2 and later do (fpconv_dtoa): the
+// shortest digits that read back as the same number, so 0.1 + -1.5 is
+// "-1.4", laid out as a plain integer, a plain decimal or scientific
+// notation by fpconv's rules.
 func formatScore(f float64) string {
 	switch {
 	case math.IsInf(f, 1):
 		return "inf"
 	case math.IsInf(f, -1):
 		return "-inf"
+	case f == 0:
+		return "0"
 	}
-	return strconv.FormatFloat(f, 'g', 17, 64)
+	// Shortest digits and decimal exponent: d.ddd e±x.
+	e := strconv.FormatFloat(f, 'e', -1, 64)
+	neg := e[0] == '-'
+	if neg {
+		e = e[1:]
+	}
+	mant, expStr, _ := strings.Cut(e, "e")
+	digits := strings.Replace(mant, ".", "", 1)
+	x, _ := strconv.Atoi(expStr)
+	nd := len(digits)
+	k := x - (nd - 1) // the value is digits × 10^k
+	exp := x
+	if exp < 0 {
+		exp = -exp
+	}
+
+	var b strings.Builder
+	if neg {
+		b.WriteByte('-')
+	}
+	switch {
+	case k >= 0 && exp < nd+7: // plain integer
+		b.WriteString(digits)
+		b.WriteString(strings.Repeat("0", k))
+	case k < 0 && (k > -7 || exp < 4): // plain decimal
+		if offset := nd + k; offset <= 0 {
+			b.WriteString("0.")
+			b.WriteString(strings.Repeat("0", -offset))
+			b.WriteString(digits)
+		} else {
+			b.WriteString(digits[:offset])
+			b.WriteByte('.')
+			b.WriteString(digits[offset:])
+		}
+	default: // scientific, with no padding in the exponent
+		b.WriteByte(digits[0])
+		if nd > 1 {
+			b.WriteByte('.')
+			b.WriteString(digits[1:])
+		}
+		b.WriteByte('e')
+		if x < 0 {
+			b.WriteByte('-')
+		} else {
+			b.WriteByte('+')
+		}
+		b.WriteString(strconv.Itoa(exp))
+	}
+	return b.String()
 }
 
 func parseBound(b []byte) (keyspace.ScoreBound, error) {

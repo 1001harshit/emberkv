@@ -94,7 +94,8 @@ func TestSortedSetCommands(t *testing.T) {
 	c.expect(int64(1), "ZREMRANGEBYRANK", "r", "-1", "-1")
 	c.expect(list("a", "1"), "ZRANGE", "r", "0", "-1", "WITHSCORES")
 	c.do("ZADD", "inf", "+inf", "top", "-inf", "bottom", "0.1", "tenth")
-	c.expect(list("bottom", "-inf", "tenth", "0.10000000000000001", "top", "inf"), "ZRANGE", "inf", "0", "-1", "WITHSCORES")
+	// Redis 7.2 and later print the shortest form; 7.0 printed 0.10000000000000001.
+	c.expect(list("bottom", "-inf", "tenth", "0.1", "top", "inf"), "ZRANGE", "inf", "0", "-1", "WITHSCORES")
 }
 
 func TestListsAndZSetsAsOf(t *testing.T) {
