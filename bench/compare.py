@@ -255,7 +255,8 @@ COMPAT = [
     ["ZMSCORE", "Z", "a", "zz"], ["ZINCRBY", "Z", "0.1", "d"], ["ZCARD", "Z"], ["ZPOPMIN", "Z"],
     # Score formatting at fpconv's switch points between plain and scientific notation.
     ["ZADD", "ZF", "1e7", "a", "1e8", "b", "123e10", "c", "1e21", "d", "1e22", "e", "0.0001", "f",
-     "1.5e-6", "g", "1e-7", "h", "-2.5e-5", "i", "123456789012345680", "j"],
+     "1.5e-6", "g", "1e-7", "h", "-2.5e-5", "i", "123456789012345680", "j", "1e20", "k", "1e-6", "l",
+     "1.25e-6", "m", "0.5", "n"],
     ["ZRANGE", "ZF", "0", "-1", "WITHSCORES"], ["ZINCRBY", "ZF", "0.2", "a"], ["ZSCORE", "ZF", "f"],
     ["ZPOPMAX", "Z", "2"], ["ZREM", "Z", "c", "zz"], ["ZADD", "Z2", "1", "a", "2", "b", "3", "c", "4", "d"],
     ["ZREMRANGEBYRANK", "Z2", "0", "0"], ["ZREMRANGEBYSCORE", "Z2", "-inf", "(3"], ["ZRANGE", "Z2", "0", "-1"],

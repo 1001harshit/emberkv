@@ -83,7 +83,7 @@ func formatScore(f float64) string {
 		b.WriteByte('-')
 	}
 	switch {
-	case k >= 0 && exp < nd+7: // plain integer
+	case k >= 0 && exp < 21: // plain integer, below 1e21
 		b.WriteString(digits)
 		b.WriteString(strings.Repeat("0", k))
 	case k < 0 && (k > -7 || exp < 4): // plain decimal
