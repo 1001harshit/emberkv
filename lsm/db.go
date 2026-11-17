@@ -165,7 +165,11 @@ type DB struct {
 	// compactMu ensures only one compaction runs at a time.
 	compactMu sync.Mutex
 
-	// mu guards the fields below. Lock order: key locks, appendMu, compactMu, mu.
+	// manifestMu orders manifest writes, which happen without holding mu.
+	manifestMu sync.Mutex
+
+	// mu guards the fields below. Lock order: key locks, appendMu, compactMu,
+	// manifestMu, mu.
 	mu      sync.RWMutex
 	stall   *sync.Cond
 	mem     *memtable.Memtable
@@ -319,7 +323,25 @@ func (db *DB) recover() error {
 	return err
 }
 
-func (db *DB) saveManifestLocked() error {
+// commitState applies change to the table set under mu, then records the
+// new set in the manifest after releasing mu. Writing the manifest fsyncs
+// twice, which takes milliseconds; holding mu meanwhile would stall every
+// read and write. Callers delete files the old set needed only after it
+// returns without error, so a crash at any point leaves a manifest whose
+// files all exist.
+func (db *DB) commitState(change func()) error {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	db.mu.Lock()
+	change()
+	m := db.manifestLocked()
+	db.mu.Unlock()
+	return writeManifest(db.dir, m)
+}
+
+func (db *DB) saveManifestLocked() error { return writeManifest(db.dir, db.manifestLocked()) }
+
+func (db *DB) manifestLocked() manifest {
 	m := manifest{Format: formatVersion, NextFile: db.nextFile.Load(), LastVersion: db.lastVersion.Load(), Tables: []uint64{}}
 	for _, t := range db.tables {
 		m.Tables = append(m.Tables, t.id)
@@ -330,7 +352,7 @@ func (db *DB) saveManifestLocked() error {
 			m.Cutoffs[t.id] = t.cutoff
 		}
 	}
-	return writeManifest(db.dir, m)
+	return m
 }
 
 // writeTable writes the entries from it, in entry order, to a new table.
@@ -762,14 +784,13 @@ func (db *DB) flush(im *immutable) error {
 	if err != nil {
 		return err
 	}
-	db.mu.Lock()
-	if t != nil {
-		db.tables = append([]*table{t}, db.tables...)
-	}
-	db.imm = db.imm[:len(db.imm)-1]
-	err = db.saveManifestLocked()
-	db.stall.Broadcast()
-	db.mu.Unlock()
+	err = db.commitState(func() {
+		if t != nil {
+			db.tables = append([]*table{t}, db.tables...)
+		}
+		db.imm = db.imm[:len(db.imm)-1]
+		db.stall.Broadcast()
+	})
 	if err != nil {
 		return err // keep the log; recovery will replay it
 	}

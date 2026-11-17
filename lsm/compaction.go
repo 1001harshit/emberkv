@@ -142,19 +142,18 @@ func (db *DB) compactRun(inputs []*table, bottom bool) error {
 		return err
 	}
 
-	db.mu.Lock()
-	// Flushes may have added newer tables since the run was chosen, but only
-	// at the front, so the run is still contiguous.
-	i := slices.Index(db.tables, inputs[0])
-	tables := make([]*table, 0, len(db.tables)-len(inputs)+1)
-	tables = append(tables, db.tables[:i]...)
-	if out != nil {
-		tables = append(tables, out)
-	}
-	tables = append(tables, db.tables[i+len(inputs):]...)
-	db.tables = tables
-	err = db.saveManifestLocked()
-	db.mu.Unlock()
+	err = db.commitState(func() {
+		// Flushes may have added newer tables since the run was chosen, but
+		// only at the front, so the run is still contiguous.
+		i := slices.Index(db.tables, inputs[0])
+		tables := make([]*table, 0, len(db.tables)-len(inputs)+1)
+		tables = append(tables, db.tables[:i]...)
+		if out != nil {
+			tables = append(tables, out)
+		}
+		tables = append(tables, db.tables[i+len(inputs):]...)
+		db.tables = tables
+	})
 	if err != nil {
 		return err
 	}
