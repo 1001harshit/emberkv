@@ -1,16 +1,56 @@
 # Changelog
 
-## Unreleased
+## v0.4.0: blocking queues, faster under load, Redis 8 replies
 
-- **Blocking list commands:** `BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH`, with Redis's semantics:
-  - Clients blocked on a key are served oldest first.
-  - Inside `MULTI`/`EXEC` they never block, and waiters are served only after `EXEC`, so a
-    transaction sees its own pushes.
-  - A client that disconnects while blocked takes nothing with it.
-  - `ROLLBACK` wakes clients whose lists it brings back.
-  - `INFO clients` reports `blocked_clients`.
-- **`emberbench -t queue,wake`** benchmarks a `BLPOP` job queue on any Redis-protocol server:
-  throughput, and how fast a push reaches a consumer that is already waiting.
+emberkv can now back a job queue: `BLPOP` and friends block until work arrives and hand it to
+waiting workers in order. This release also removes stalls that slowed writes while compaction
+ran, and matches Redis 8's replies.
+
+### New: blocking list commands
+
+`BLPOP`, `BRPOP`, `BLMOVE` and `BRPOPLPUSH`, with Redis's semantics:
+- **Order:** clients blocked on a key are served oldest first.
+- **Transactions:** inside `MULTI`/`EXEC` they never block, and waiters are served only after
+  `EXEC`, so a transaction sees its own pushes.
+- **Disconnects:** a client that disconnects while blocked takes nothing with it.
+- **Time travel:** `ROLLBACK` wakes clients whose lists it brings back.
+- **Monitoring:** `INFO clients` reports `blocked_clients`.
+
+`emberbench -t queue,wake` benchmarks a `BLPOP` job queue on any Redis-protocol server.
+
+### Faster
+
+- **Compaction no longer stalls writes to hot keys.** With history on, it copied a busy key's
+  entire history under a lock every write needs. The slowest 1% of queue hand-offs went from
+  11.1 ms to 5.5 ms on the benchmark runner, and the slowest 0.1% about 3× lower locally.
+- **The manifest is written outside the main lock,** removing 3–8 ms pauses in which every read
+  and write waited, after each flush and compaction.
+
+### Compatible with Redis 8
+
+Scores are now printed as Redis 7.2 and later print them (`ZINCRBY` by 0.1 from -1.5 replies
+`-1.4`, not `-1.3999999999999999`). **228 of 229** commands in the differential test reply
+byte-for-byte like Redis 8.0.5; the one difference is `SELECT 1`.
+
+### Performance against Redis 8
+
+One run of the [Benchmark workflow](.github/workflows/bench.yml) on a 4 vCPU GitHub runner,
+`redis-benchmark` with 50 clients, every server in the same job:
+
+| | emberkv | Redis 8 (AOF everysec) | Kvrocks | Dragonfly |
+|---|---|---|---|---|
+| `SET` req/s, pipeline 1 | 54k | 85k | 31k | 38k |
+| `SET` req/s, pipeline 16 | 169k | 467k | 58k | 439k |
+| Memory for 632k keys | **62 MiB** | 145 MiB | 182 MiB | 133 MiB |
+| Writes lost on `kill -9` | **0** | 0 (default config: all 36,156) | 0 | n/a |
+
+Redis is 1.4–2.4× faster one request at a time and 1.8–15× faster pipelined. With every write
+fsynced, emberkv reaches 69–91% of Redis. Full tables:
+[BENCHMARKS.md](BENCHMARKS.md#latest-run-against-redis-8).
+
+### Upgrading
+
+The on-disk format is unchanged: v0.4.0 opens data directories written by v0.3.0 and v0.2.0.
 
 ## v0.3.0: lists, sorted sets, transactions and Pub/Sub
 
