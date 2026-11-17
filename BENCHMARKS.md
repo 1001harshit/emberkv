@@ -2,7 +2,9 @@
 
 Produced by [`bench/compare.py`](bench/compare.py) through the
 [Benchmark workflow](.github/workflows/bench.yml), so anyone can rerun it from
-the Actions tab. Run on 2026-10-23:
+the Actions tab. The [latest run](#latest-run-against-redis-8) is summarized first; the
+sections after it are earlier runs, each labeled with what it measured. The main tables are
+from the run on 2026-10-23:
 
 - **Machine:** GitHub-hosted runner, 4 vCPU x86_64, Ubuntu 24.04. The servers and
   the load generator shared the machine.
@@ -20,6 +22,62 @@ the Actions tab. Run on 2026-10-23:
 | [Kvrocks](https://kvrocks.apache.org) | Redis protocol on RocksDB, C++. **The closest design to emberkv.** |
 | [Dragonfly](https://www.dragonflydb.io) | in-memory, multi-threaded, C++ |
 
+## Latest run: against Redis 8
+
+Run on 2026-11-17 at `9d75f43`, on the same kind of 4 vCPU GitHub runner. Ubuntu's package
+is now **Redis 8.0.5** (earlier runs had 7.0.15), and `apache/kvrocks:latest` has also moved.
+`redis-benchmark`, 50 clients, 64-byte values. emberkv keeps its default hour of history.
+
+**Requests/s, one at a time (pipeline 1), durable once a second** (emberkv `fsync everysec`,
+Redis AOF everysec):
+
+| | SET | GET | INCR | HSET | SADD | MSET | LPUSH | LPOP |
+|---|---|---|---|---|---|---|---|---|
+| **emberkv** | 54,481 | 57,225 | 50,467 | 48,757 | 48,520 | 21,803 | 52,219 | 46,937 |
+| Redis 8 | 85,434 | 82,747 | 83,717 | 85,763 | 83,928 | 51,467 | 86,207 | 85,361 |
+| Kvrocks | 30,817 | 46,115 | 31,323 | 27,666 | 31,358 | 17,249 | 28,297 | 27,390 |
+| Dragonfly | 38,204 | 35,518 | 37,764 | 42,043 | 37,182 | 34,165 | 41,964 | 43,497 |
+
+**Pipelined (16 commands per round trip):**
+
+| | SET | GET | INCR | HSET | SADD | MSET | LPUSH | LPOP |
+|---|---|---|---|---|---|---|---|---|
+| **emberkv** | 168,805 | 425,170 | 79,302 | 58,059 | 59,520 | 25,355 | 101,245 | 87,474 |
+| Redis 8 | 467,071 | 783,085 | 580,383 | 433,276 | 907,441 | 108,378 | 562,430 | 578,035 |
+| Kvrocks | 58,377 | 284,981 | 57,261 | 50,927 | 61,248 | 26,101 | 62,858 | 45,945 |
+| Dragonfly | 438,789 | 482,625 | 498,256 | 443,262 | 499,002 | 121,654 | 227,169 | 498,008 |
+
+**Every write fsynced before the reply** (emberkv `fsync always`, Redis AOF always), pipeline 1:
+
+| | SET | INCR | HSET | SADD | MSET |
+|---|---|---|---|---|---|
+| **emberkv** | 43,169 | 41,537 | 36,832 | 38,117 | 21,198 |
+| Redis 8 | 47,619 | 52,083 | 45,861 | 51,787 | 30,511 |
+| emberkv as % of Redis | 91% | 80% | 80% | 74% | 69% |
+
+| | emberkv | Redis 8 | Kvrocks | Dragonfly |
+|---|---|---|---|---|
+| Latency p50 / p99, `SET` pipeline 1 | 0.49 / 1.49 ms | 0.30 / 0.55 ms | 1.37 / 4.29 ms | 0.99 / 3.86 ms |
+| Memory for the same 632k keys | **62 MiB** | 145 MiB | 182 MiB | 133 MiB |
+| Acknowledged writes lost on `kill -9` | **0** | 0 with AOF; **all 36,156** in the default config | 0 | n/a |
+| Replies identical to Redis 8 | 228 of 229 | | | |
+
+- **vs Redis 8:** Redis is 1.4–2.4× faster one request at a time, and 1.8–15× faster pipelined.
+  With every write fsynced, both wait on the disk and emberkv reaches 69–91% of Redis.
+- **vs Kvrocks:** emberkv is 1.2–1.8× faster one request at a time. Pipelined, it is ahead on
+  `SET` (2.9×), `GET`, `INCR`, `HSET` and lists; Kvrocks is about 3% ahead on `SADD` and `MSET`.
+- **vs Dragonfly:** emberkv is faster one request at a time except `MSET`; Dragonfly, built for
+  many cores, is far ahead pipelined.
+- **Blocked clients:** this run measured the fix in `f1f386e` against the build before it. The
+  slowest 1% of push-to-delivery times went from **11.1 ms to 5.5 ms**; the median stayed at
+  0.13 ms. Redis's p99 was 0.67 ms. Queue throughput in this run is not usable: the baseline,
+  which ran first, moved 26k items/s, but everything after it, Redis included, moved 8–16k. A
+  local A/B of the two builds showed the fix 3–7% faster.
+- **Noise:** in this run the build with the fix also came out 0–20% below the build before it on
+  some write tests (most on `MSET`). A local A/B of the same two builds, alternated three times,
+  showed the fix equal or faster on all of them (pipelined `MSET` +17–24%). The before/after
+  rows share one machine but not one moment, so treat single-run gaps under about 20% as noise.
+
 ## Summary
 
 - **Crash safety:** like Redis with AOF and Kvrocks, emberkv lost **zero** acknowledged writes
@@ -30,21 +88,23 @@ the Actions tab. Run on 2026-10-23:
   it is **3.4× faster for `SET`**, 1.4× for `GET` and `INCR`, and 1.1× for `MSET`. Kvrocks is
   ahead on pipelined `HSET` and `SADD`.
 - **vs Redis:** Redis is faster, as an in-memory C server should be: 1.2–1.3× at pipeline 1, and
-  1.6–12× pipelined.
+  1.6–12× pipelined, against Redis 7.0. Against Redis 8.0 in the latest run: 1.4–2.4× and 1.8–15×.
 - **Time travel has a cost:** with the default 1 hour of history, pipelined throughput is 13–29%
   lower than before history existed. With history off, 7–21% lower (see below).
 - **Against other databases that can read the past** (etcd, immudb, Dolt): emberkv was the fastest
   at writes, current reads, past reads and history, and used the least disk. Dolt created
   branches faster. See [the comparison](#against-other-databases-that-can-read-the-past).
 - **Blocking queue (`BLPOP`):** emberkv moved as many items as Redis and 3× as many as Kvrocks.
-  A push reached a waiting consumer in 0.13 ms typically, but the p99 was 5.9 ms against Redis's
-  0.2 ms. See [the queue test](#blocking-list-queue-blpop).
+  A push reached a waiting consumer in 0.13 ms typically. The slowest 1% took 5.9 ms against
+  Redis's 0.2 ms; a fix for stalls behind compaction then halved emberkv's p99 in the latest run.
+  See [the queue test](#blocking-list-queue-blpop).
 - **Lists and sorted sets:** emberkv beats Kvrocks on every list test, and at pipeline 1 is close
   to Dragonfly. Kvrocks's sorted-set tests did not finish. Pipelined `LRANGE_100` and `ZADD` are
   the weak spots. See [lists and sorted sets](#lists-and-sorted-sets).
 - **Compatibility:** 146 of 147 commands returned byte-for-byte the same reply as Redis 7.0.
   A later run that added lists, sorted sets, transactions, Pub/Sub and blocking commands matched
   on 223 of 225. The second difference was a TTL read a second later; the harness now allows that.
+  Against Redis 8.0.5, which prints scores in a shorter form, it matches on 228 of 229.
   The one difference is `SELECT 1`, because emberkv has a single database. All 10 `redis-cli`
   checks passed (`--scan`, `--pipe`, stdin mode, `--latency`), and the comparison itself
   was driven through `redis-py`.

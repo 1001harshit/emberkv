@@ -5,6 +5,8 @@
 
 **A Redis-compatible database with time travel. Read any key as it was 10 minutes ago, undo an accidental `FLUSHALL`, and branch your whole dataset in milliseconds.**
 
+![A redis-cli session: data is written, FLUSHALL wipes it, ASOF reads the old value and ROLLBACK brings everything back](docs/demo.gif)
+
 emberkv speaks the Redis protocol, so `redis-cli` and every Redis client library work with it. Unlike Redis, it keeps your data on disk, survives `kill -9`, and **remembers history**:
 
 ```
@@ -281,23 +283,24 @@ go test -race ./...
 
 ### Compared with Redis, Kvrocks and Dragonfly
 
-From the [Benchmark workflow](.github/workflows/bench.yml), on one 4 vCPU GitHub runner with `redis-benchmark`. Full tables, method and caveats are in **[BENCHMARKS.md](BENCHMARKS.md)**.
+From the [Benchmark workflow](.github/workflows/bench.yml)'s latest run, on one 4 vCPU GitHub runner with `redis-benchmark` and 50 clients, against **Redis 8.0.5**. Full tables, method and caveats are in **[BENCHMARKS.md](BENCHMARKS.md#latest-run-against-redis-8)**.
 
-| | emberkv | Redis (AOF everysec) | Kvrocks | Dragonfly |
+| | emberkv | Redis 8 (AOF everysec) | Kvrocks | Dragonfly |
 |---|---|---|---|---|
-| `SET` req/s, pipeline 1 | 53k | 68k | 36k | 40k |
-| `GET` req/s, pipeline 1 | 54k | 65k | 46k | 40k |
-| `SET` req/s, pipeline 16 | 227k | 456k | 67k | 452k |
-| `GET` req/s, pipeline 16 | 490k | 780k | 340k | 471k |
-| Memory for 632k keys | **58 MiB** | 139 MiB | 268 MiB | 139 MiB |
+| `SET` req/s, pipeline 1 | 54k | 85k | 31k | 38k |
+| `GET` req/s, pipeline 1 | 57k | 83k | 46k | 36k |
+| `SET` req/s, pipeline 16 | 169k | 467k | 58k | 439k |
+| `GET` req/s, pipeline 16 | 425k | 783k | 285k | 483k |
+| Memory for 632k keys | **62 MiB** | 145 MiB | 182 MiB | 133 MiB |
 | Acked writes lost on `kill -9` | **0** | 0 (default config: all) | 0 | n/a |
+| Replies identical to Redis 8 | 228 of 229 | | | |
 | Time travel and branches | **yes** | no | no | no |
 
 For lists, emberkv beats Kvrocks on every test, pipelined or not: for example 82k `LPOP`/s at pipeline 16 against Kvrocks's 72k. At pipeline 1 it is close to Dragonfly. Pipelined `LRANGE_100` and `ZADD` on one hot key are its weak spots. Details are in [BENCHMARKS.md](BENCHMARKS.md#lists-and-sorted-sets).
 
-As a `BLPOP` job queue, emberkv moved 25k items/s, the same as Redis and 3× Kvrocks. A push reached a waiting consumer in 0.13 ms at the median, against Redis's 0.08 ms; at p99 it was 5.9 ms against 0.2 ms. Details are in [BENCHMARKS.md](BENCHMARKS.md#blocking-list-queue-blpop).
+As a `BLPOP` job queue, emberkv moved 25k items/s, the same as Redis and 3× Kvrocks. A push reached a waiting consumer in 0.13 ms at the median, against Redis's 0.08 ms. The slowest 1% were the weak spot; a fix for stalls behind compaction halved emberkv's p99 from 11.1 ms to 5.5 ms, against Redis's 0.67 ms. Details are in [BENCHMARKS.md](BENCHMARKS.md#blocking-list-queue-blpop).
 
-emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.4× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
+emberkv numbers are with the default one hour of history. Redis is faster, as an in-memory C server should be: 1.4–2.4× one request at a time and 1.8–15× pipelined. With every write fsynced, emberkv reaches 69–91% of Redis. emberkv beats Kvrocks, the closest on-disk design, on most commands, uses about 2.3× less memory than Redis, and is the only one of the four that can read the past. The measured price of that is in [BENCHMARKS.md](BENCHMARKS.md#the-cost-of-time-travel).
 
 ### Compared with other databases that can read the past
 
