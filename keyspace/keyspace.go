@@ -351,26 +351,37 @@ func (s *Store) isGarbage(k []byte) bool {
 		// a little longer is always safe.
 		return s.shared.gcStale
 	}
-	horizon := s.db.OldestReadable()
 	stale := true
-	err := s.db.History(metaKey(key), func(v lsm.Version) bool {
-		// A version can only show the fields while it is not expired, and
-		// readers start at the window's beginning at the earliest.
-		from := v.At
-		if from.Before(horizon) {
-			from = horizon
+	// The usual case is a record of a live collection, which the current
+	// metadata shows with one point lookup. Only otherwise walk the history,
+	// which reads the key in every table.
+	if item, err := s.db.GetItem(metaKey(key)); err == nil {
+		if m, err := decodeMeta(item); err == nil && m.typ.isContainer() && m.version == gen {
+			stale = false
 		}
-		visible := !v.Deleted && (v.Item.ExpireAt == 0 || v.Item.ExpireAt > from.UnixMilli())
-		if visible {
-			if m, err := decodeMeta(v.Item); err == nil && m.typ.isContainer() && m.version == gen {
-				stale = false
-				return false
+	}
+	horizon := s.db.OldestReadable()
+	var err error
+	if stale {
+		err = s.db.History(metaKey(key), func(v lsm.Version) bool {
+			// A version can only show the fields while it is not expired, and
+			// readers start at the window's beginning at the earliest.
+			from := v.At
+			if from.Before(horizon) {
+				from = horizon
 			}
-		}
-		// Keep going through the window; the first version at or before
-		// its start is the last one a reader can see.
-		return v.At.After(horizon)
-	})
+			visible := !v.Deleted && (v.Item.ExpireAt == 0 || v.Item.ExpireAt > from.UnixMilli())
+			if visible {
+				if m, err := decodeMeta(v.Item); err == nil && m.typ.isContainer() && m.version == gen {
+					stale = false
+					return false
+				}
+			}
+			// Keep going through the window; the first version at or before
+			// its start is the last one a reader can see.
+			return v.At.After(horizon)
+		})
+	}
 	if err != nil {
 		return false // when in doubt, keep
 	}

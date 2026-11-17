@@ -150,16 +150,12 @@ func (m *Memtable) Len() int {
 	return m.count
 }
 
-// Versions returns an iterator over a snapshot of the versions of key alone,
-// newest first. Unlike Iterator it copies nothing else.
+// Versions returns an iterator over the versions of key alone, newest
+// first. Like Iterator it copies them in small batches, so a caller that
+// stops after the newest few does not copy, under the lock writers need,
+// every version a hot key has accumulated.
 func (m *Memtable) Versions(key []byte) base.Iterator {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var entries []base.Entry
-	for n := m.findGE(key, base.MaxVersion, nil); n != nil && bytes.Equal(n.entry.Key, key); n = n.next[0] {
-		entries = append(entries, n.entry)
-	}
-	return base.NewSliceIterator(entries)
+	return &iterator{m: m, start: key, only: true, batch: 16}
 }
 
 // Iterator returns an iterator over every version of every key >= start
@@ -175,6 +171,7 @@ func (m *Memtable) Iterator(start []byte) base.Iterator {
 type iterator struct {
 	m       *Memtable
 	start   []byte
+	only    bool  // stop after the versions of start
 	last    *node // last node copied, nil before the first batch
 	done    bool
 	batch   int
@@ -205,6 +202,10 @@ func (it *iterator) fill() {
 	}
 	it.entries, it.i = it.entries[:0], 0
 	for ; n != nil && len(it.entries) < it.batch; n = n.next[0] {
+		if it.only && !bytes.Equal(n.entry.Key, it.start) {
+			n = nil
+			break
+		}
 		it.entries = append(it.entries, n.entry)
 		it.last = n
 	}
