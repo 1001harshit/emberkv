@@ -49,10 +49,11 @@ func parseScore(b []byte) (float64, error) {
 
 // formatScore matches Redis 7.0's replies for doubles: "%.17g", with "inf"
 // and "-inf".
-// formatScore writes a score as Redis 7.2 and later do (fpconv_dtoa): the
-// shortest digits that read back as the same number, so 0.1 + -1.5 is
-// "-1.4", laid out as a plain integer, a plain decimal or scientific
-// notation by fpconv's rules.
+// formatScore writes a score as Redis 7.2 and later do (d2string): a whole
+// number that converts to a 64-bit integer exactly is printed as one;
+// anything else gets fpconv_dtoa's shortest digits that read back as the
+// same number, so 0.1 + -1.5 is "-1.4", laid out as a plain integer, a
+// plain decimal or scientific notation by fpconv's rules.
 func formatScore(f float64) string {
 	switch {
 	case math.IsInf(f, 1):
@@ -60,7 +61,12 @@ func formatScore(f float64) string {
 	case math.IsInf(f, -1):
 		return "-inf"
 	case f == 0:
+		if math.Signbit(f) {
+			return "-0"
+		}
 		return "0"
+	case math.Abs(f) <= math.MaxInt64/2 && f == math.Trunc(f):
+		return strconv.FormatInt(int64(f), 10)
 	}
 	// Shortest digits and decimal exponent: d.ddd e±x.
 	e := strconv.FormatFloat(f, 'e', -1, 64)
@@ -83,7 +89,7 @@ func formatScore(f float64) string {
 		b.WriteByte('-')
 	}
 	switch {
-	case k >= 0 && exp < 21: // plain integer, below 1e21
+	case k >= 0 && exp < nd+7: // plain integer: up to 7 trailing zeros
 		b.WriteString(digits)
 		b.WriteString(strings.Repeat("0", k))
 	case k < 0 && (k > -7 || exp < 4): // plain decimal
